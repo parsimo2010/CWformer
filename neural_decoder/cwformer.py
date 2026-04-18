@@ -159,7 +159,26 @@ class ConvSubsampling(nn.Module):
         else:
             x_padded = F.pad(x, (0, 0, 2, 0))  # time left-pad=2
 
-        new_sub_buf1 = x[:, :, -2:, :].clone()  # save last 2 mel frames
+        # Carry-over for stride-2 conv: next output would read positions
+        # [2*n_out, 2*n_out+1, 2*n_out+2]. Save frames from position 2*n_out
+        # onward. Size is 1 for odd padded-length, 2 for even. Saving a fixed
+        # 2 frames — as the pre-fix code did — drifts by one mel frame
+        # whenever a chunk has odd padded length (first chunk has N=49 mels
+        # with the default 500ms chunk size), misaligning every subsequent
+        # chunk's conv1 input.
+        L1 = x_padded.shape[2]
+        if L1 < 3:  # conv1 kernel size
+            # Too few frames to run conv1 — carry everything forward and
+            # emit an empty output. sub_buf2 stays unchanged since conv2
+            # doesn't run either.
+            empty_out = torch.zeros(
+                B, 0, self.linear.out_features,
+                device=x.device, dtype=x.dtype,
+            )
+            return empty_out, x_padded.clone(), sub_buf2
+        n_out1 = (L1 - 1) // 2
+        carry1 = L1 - 2 * n_out1  # 1 or 2
+        new_sub_buf1 = x_padded[:, :, -carry1:, :].clone()
 
         # Freq padding (symmetric)
         x_padded = F.pad(x_padded, (1, 1, 0, 0))
@@ -245,16 +264,17 @@ class CWFormer(nn.Module):
         # Conv subsampling (causal)
         x, out_lengths = self.subsampling(mel, mel_lengths)
 
-        # Create padding mask from lengths
-        mask = None
+        # Clamp out_lengths to actual tensor length for downstream
+        # CTC-loss consumers (guards against length formula rounding).
+        # No padding mask is built here: causal attention already
+        # prevents any valid frame from attending to padded (future)
+        # frames, and LayerNorm is per-frame throughout the Conformer
+        # stack, so padded frames cannot contaminate valid-frame stats.
         if out_lengths is not None:
-            B, T, _ = x.shape
-            # Clamp to actual tensor length (guards against length formula rounding)
-            out_lengths = out_lengths.clamp(max=T)
-            mask = torch.arange(T, device=x.device).unsqueeze(0) >= out_lengths.unsqueeze(1)
+            out_lengths = out_lengths.clamp(max=x.shape[1])
 
         # Conformer encoder (causal — is_causal=True internally, no state)
-        x, _, _ = self.encoder(x, mask=mask)
+        x, _, _ = self.encoder(x)
 
         # CTC head
         logits = self.ctc_head(x)                        # (B, T, C)
@@ -319,6 +339,17 @@ class CWFormer(nn.Module):
         log_probs : Tensor, shape (T_out, B, C) — CTC log-probs for this chunk
         new_state : dict with updated streaming state
         """
+        # Empty mel chunk (short final flush before any STFT frame fits):
+        # nothing to process, state is unchanged. Must guard here because
+        # subsampling's Conv2d crashes if the time dim is smaller than the
+        # kernel.
+        if mel_chunk.shape[1] == 0:
+            return (
+                torch.zeros(0, mel_chunk.shape[0], self.config.num_classes,
+                            device=mel_chunk.device),
+                dict(state),
+            )
+
         # Conv subsampling (causal, streaming)
         x, new_sub_buf1, new_sub_buf2 = self.subsampling.forward_streaming(
             mel_chunk, state['sub_buf1'], state['sub_buf2'],
@@ -341,7 +372,23 @@ class CWFormer(nn.Module):
             pos_offset=pos_offset,
         )
 
-        # Trim KV caches if they exceed max_cache_len
+        # Trim KV caches to at most max_cache_len frames AFTER the concat
+        # that `encoder` already performed (k_cached || k_new).
+        #
+        # Why trim post-concat, not pre-concat:
+        #   - Pre-concat trim would let attention run on up to
+        #     (max_cache_len + T_chunk) frames in the CURRENT chunk's
+        #     attention call, briefly exceeding the training max
+        #     sequence length and asking RoPE to extrapolate.
+        #   - Post-concat trim puts the cap on what the NEXT chunk sees:
+        #     the next chunk's attention will run on
+        #     (max_cache_len + T_chunk_next) <= training_max frames,
+        #     as long as `max_cache_len` is sized as
+        #     `training_max - expected_chunk_frames`.
+        #
+        # The current chunk's attention already ran with an un-trimmed
+        # (T_prev + T_chunk) cache — which is safe because the PREVIOUS
+        # trim ensured T_prev <= max_cache_len.
         max_cache = self.config.conformer.max_cache_len
         trimmed_kv_caches = []
         for k_cache, v_cache in new_kv_caches:

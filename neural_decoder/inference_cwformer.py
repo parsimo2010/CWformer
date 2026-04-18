@@ -107,6 +107,20 @@ def _load_audio(path: str, target_sr: int) -> np.ndarray:
     return audio
 
 
+def _peak_normalize(audio: np.ndarray, target_peak: float = 0.7) -> np.ndarray:
+    """Scale audio so that its peak magnitude equals target_peak.
+
+    Matches the peak-normalization morse_generator applies to every
+    training sample. Without it, the log-mel feature scale at the model
+    input depends on the caller's recording gain, shifting subsampling
+    ReLU outputs off-distribution.
+    """
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak > 1e-9:
+        return (audio * (target_peak / peak)).astype(np.float32, copy=False)
+    return audio.astype(np.float32, copy=False)
+
+
 # ---------------------------------------------------------------------------
 # CWFormerStreamingDecoder
 # ---------------------------------------------------------------------------
@@ -135,6 +149,11 @@ class CWFormerStreamingDecoder:
             Does not affect accuracy (mathematically identical output).
         device: PyTorch device string.
         max_cache_sec: Maximum KV cache duration in seconds (default 30).
+            Defaults to training's max_audio_sec so relative attention
+            distances stay within the distribution the model actually saw.
+            Extending beyond this relies on RoPE extrapolation, which
+            degrades accuracy on long audio. Set to None to use the cache
+            length stored in the checkpoint config.
     """
 
     def __init__(
@@ -142,7 +161,7 @@ class CWFormerStreamingDecoder:
         checkpoint: str,
         chunk_ms: int = 500,
         device: str = "cpu",
-        max_cache_sec: float = 30.0,
+        max_cache_sec: Optional[float] = 30.0,
     ) -> None:
         self.device = torch.device(device)
         self.chunk_ms = chunk_ms
@@ -150,6 +169,13 @@ class CWFormerStreamingDecoder:
         self._model, self._model_cfg, self.sample_rate = (
             _load_cwformer_checkpoint(checkpoint, self.device)
         )
+
+        # Cap KV cache to match training distribution (relative positions
+        # exceeding training's max are RoPE extrapolation territory).
+        if max_cache_sec is not None:
+            # CTC output frames are at 50 fps (2× subsampling from 10 ms mel).
+            frames_per_sec = self.sample_rate // self._model_cfg.mel.hop_length // 2
+            self._model.config.conformer.max_cache_len = int(max_cache_sec * frames_per_sec)
 
         # Chunk size in samples
         self._chunk_samples = int(chunk_ms * self.sample_rate / 1000)
@@ -197,10 +223,24 @@ class CWFormerStreamingDecoder:
     def flush(self) -> str:
         """Process any remaining buffered audio. Call at end of stream.
 
+        Right-pads the final chunk with ``n_fft // 2`` zeros before
+        passing it to the model so the training-time
+        ``forward()``-vs-streaming tail frame count matches exactly.
+        Training pads both sides of the full utterance with
+        ``n_fft // 2`` (see ``MelFrontend.forward``); streaming only
+        left-pads the very first chunk. Without this right-pad, the
+        final 1-2 mel frames that training saw are missing from the
+        streaming output, truncating the tail of the CTC decode.
+
         Returns any newly decoded characters from the partial chunk.
         """
         if len(self._audio_buffer) > 0:
-            chunk = self._audio_buffer
+            n_fft = self._model_cfg.mel.n_fft
+            pad_right = n_fft // 2
+            chunk = np.concatenate(
+                [self._audio_buffer,
+                 np.zeros(pad_right, dtype=np.float32)]
+            )
             self._audio_buffer = np.zeros(0, dtype=np.float32)
             return self._process_chunk(chunk)
         return ""
@@ -211,8 +251,17 @@ class CWFormerStreamingDecoder:
         return self.decode_audio(audio)
 
     def decode_audio(self, audio: np.ndarray) -> str:
-        """Decode complete audio array by feeding as streaming chunks."""
+        """Decode complete audio array by feeding as streaming chunks.
+
+        Peak-normalizes to the training target amplitude range so the
+        log-mel feature distribution at the subsampling input matches
+        what the model saw during training (morse_generator normalizes
+        every training sample to peak = target_amplitude ∈ [0.5, 0.9]).
+        Without this, real recordings with arbitrary peak levels land
+        outside the training distribution at block 0.
+        """
         self.reset()
+        audio = _peak_normalize(audio, target_peak=0.7)
         pos = 0
         while pos < len(audio):
             end = min(pos + self._chunk_samples, len(audio))

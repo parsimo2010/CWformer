@@ -164,28 +164,55 @@ class MelComputer:
     ) -> Tuple[np.ndarray, np.ndarray]:
         """Compute mel for an audio chunk with STFT overlap buffer.
 
+        Mirrors the PyTorch logic at
+        ``neural_decoder/mel_frontend.py:compute_streaming``:
+
+        - On the very first chunk (``stft_buffer is None``) left-pad by
+          ``n_fft // 2`` so the STFT frame grid starts at the same sample
+          as the full-forward ``forward()`` path.
+        - No per-chunk right-padding. Training right-pads only once at
+          the end of the full utterance; padding every chunk invents
+          spectral frames over zeros that don't exist in the stream.
+        - The carry-forward buffer is ``audio[consumed_up_to:]``, where
+          ``consumed_up_to = n_frames * hop``. This is exactly the
+          portion of ``audio`` whose samples have not yet been covered
+          by a completed STFT frame — the next frame will start there.
+
         Returns:
             mel: (1, T, n_mels) float32 array.
-            new_buffer: overlap samples for next call.
+            new_buffer: carry-forward samples for next call.
         """
-        overlap = self.n_fft - self.hop  # 240
-
         if stft_buffer is not None:
-            audio = np.concatenate([stft_buffer, audio_chunk])
+            audio = np.concatenate([stft_buffer, audio_chunk]).astype(np.float32)
         else:
-            audio = np.pad(audio_chunk, (self.n_fft // 2, 0))
+            # First chunk: left-pad by n_fft//2 to match forward()'s grid
+            audio = np.pad(audio_chunk, (self.n_fft // 2, 0)).astype(np.float32)
 
-        new_buffer = audio[-overlap:].copy().astype(np.float32)
+        audio_len = len(audio)
+        n_frames = (audio_len - self.n_fft) // self.hop + 1 if audio_len >= self.n_fft else 0
 
-        audio_padded = np.pad(audio, (0, self.n_fft // 2)).astype(np.float32)
+        # Carry forward every sample that hasn't been covered by a full
+        # completed frame. The last completed frame covers samples
+        # [(n_frames-1)*hop, (n_frames-1)*hop + n_fft). The next frame
+        # would start at n_frames*hop — so everything from that index
+        # onward must carry to the next call.
+        if n_frames > 0:
+            consumed_up_to = n_frames * self.hop
+            new_buffer = audio[consumed_up_to:].copy()
+        else:
+            # Not enough samples for a single frame — carry everything.
+            new_buffer = audio.copy()
 
-        n_frames = (len(audio_padded) - self.n_fft) // self.hop + 1
         if n_frames <= 0:
             return np.zeros((1, 0, self.n_mels), dtype=np.float32), new_buffer
 
+        # STFT only over the portion covered by complete frames.
+        stft_len = (n_frames - 1) * self.hop + self.n_fft
+        audio_for_stft = audio[:stft_len]
+
         shape = (n_frames, self.n_fft)
-        strides = (audio_padded.strides[0] * self.hop, audio_padded.strides[0])
-        frames = np.lib.stride_tricks.as_strided(audio_padded, shape=shape,
+        strides = (audio_for_stft.strides[0] * self.hop, audio_for_stft.strides[0])
+        frames = np.lib.stride_tricks.as_strided(audio_for_stft, shape=shape,
                                                   strides=strides)
 
         windowed = frames * self.window

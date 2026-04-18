@@ -164,6 +164,14 @@ class MorseConfig:
     multi_op_speed_change_min: float = 0.7   # min speed multiplier at change point
     multi_op_speed_change_max: float = 1.4   # max speed multiplier at change point
 
+    # Random input gain (dB), applied AFTER peak-normalisation in
+    # generate_sample(). Drawn log-uniformly in [lo, hi] dB per sample and
+    # multiplied onto the waveform (then clipped to [-1, 1]). Teaches the
+    # model to handle inputs that aren't peak-normalised, which matches
+    # the real streaming inference regime where per-chunk peak varies.
+    # (0.0, 0.0) disables the augmentation (preserves legacy behaviour).
+    input_gain_db_range: Tuple[float, float] = (0.0, 0.0)
+
     def to_dict(self) -> dict:
         return asdict(self)
 
@@ -395,8 +403,8 @@ def create_default_config(scenario: str = "clean") -> Config:
     elif scenario == "clean":
         cfg.morse.min_snr_db = 15.0
         cfg.morse.max_snr_db = 40.0
-        cfg.morse.min_wpm = 10.0
-        cfg.morse.max_wpm = 40.0
+        cfg.morse.min_wpm = 5.0
+        cfg.morse.max_wpm = 50.0
         cfg.morse.min_chars = 30
         cfg.morse.max_chars = 150
         cfg.morse.dah_dit_ratio_min = 2.5
@@ -416,8 +424,9 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.num_workers = 4
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (mild -- model learns basic task first)
-        cfg.morse.agc_probability = 0.3
-        # qsb_probability left at 0.0 for clean stage
+        cfg.morse.agc_probability = 0.2
+        # qsb_probability stays off for the clean stage
+        cfg.morse.qsb_probability = 0.0
         # Key type: mostly paddles (easiest) for clean stage; no cootie yet
         cfg.morse.key_type_weights = (0.20, 0.20, 0.60, 0.0)
         # Farnsworth: mild introduction (10% of samples, mild stretch)
@@ -433,12 +442,14 @@ def create_default_config(scenario: str = "clean") -> Config:
         # Real HF noise: mild introduction (15% of samples)
         cfg.morse.hf_noise_probability = 0.15
         cfg.morse.hf_noise_mix_ratio = 0.5
+        # Input gain: disabled for the clean stage (waveform stays peak-normalised)
+        cfg.morse.input_gain_db_range = (0.0, 0.0)
 
     elif scenario == "moderate":
-        cfg.morse.min_snr_db = 8.0
+        cfg.morse.min_snr_db = 5.0
         cfg.morse.max_snr_db = 35.0
-        cfg.morse.min_wpm = 8.0
-        cfg.morse.max_wpm = 45.0
+        cfg.morse.min_wpm = 5.0
+        cfg.morse.max_wpm = 50.0
         cfg.morse.min_chars = 25
         cfg.morse.max_chars = 175
         cfg.morse.dah_dit_ratio_min = 1.8
@@ -458,7 +469,7 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.num_workers = 4
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (moderate strength)
-        cfg.morse.agc_probability = 0.5
+        cfg.morse.agc_probability = 0.4
         cfg.morse.agc_depth_db_max = 18.0
         cfg.morse.qsb_probability = 0.25
         cfg.morse.qsb_depth_db_max = 12.0
@@ -478,8 +489,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.qrn_probability = 0.15
         cfg.morse.qrn_rate_max = 3.0
         cfg.morse.qrn_amplitude_max = 1.0
-        # Bandpass filter: most samples, narrower filters, sharper slopes
-        cfg.morse.bandpass_probability = 0.70
+        # Bandpass filter: narrower filters, sharper slopes
+        cfg.morse.bandpass_probability = 0.60
         cfg.morse.bandpass_bw_min = 250.0
         cfg.morse.bandpass_bw_max = 500.0
         cfg.morse.bandpass_order_min = 4
@@ -487,13 +498,15 @@ def create_default_config(scenario: str = "clean") -> Config:
         # Real HF noise: moderate (30% of samples)
         cfg.morse.hf_noise_probability = 0.30
         cfg.morse.hf_noise_mix_ratio = 0.6
-        # Multi-operator: light (10% of samples)
-        cfg.morse.multi_op_probability = 0.10
+        # Multi-operator: disabled at moderate stage
+        cfg.morse.multi_op_probability = 0.0
         cfg.morse.multi_op_speed_change_min = 0.8
         cfg.morse.multi_op_speed_change_max = 1.3
+        # Input gain: ±6 dB log-uniform per sample
+        cfg.morse.input_gain_db_range = (-6.0, 6.0)
 
     elif scenario == "full":
-        cfg.morse.min_snr_db = 3.0
+        cfg.morse.min_snr_db = -5.0
         cfg.morse.max_snr_db = 30.0
         cfg.morse.min_wpm = 5.0
         cfg.morse.max_wpm = 50.0
@@ -517,7 +530,7 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.training.num_workers = 4
         cfg.training.beam_cer_interval = 50
         # Real-world augmentations (full strength for curriculum stage 3)
-        cfg.morse.agc_probability = 0.7
+        cfg.morse.agc_probability = 0.5
         cfg.morse.agc_depth_db_max = 22.0
         cfg.morse.qsb_probability = 0.50
         cfg.morse.qsb_depth_db_max = 18.0
@@ -537,8 +550,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.qrn_probability = 0.25
         cfg.morse.qrn_rate_max = 5.0
         cfg.morse.qrn_amplitude_max = 2.0
-        # Bandpass filter: nearly all samples, full range of widths and slopes
-        cfg.morse.bandpass_probability = 0.90
+        # Bandpass filter: wider filters, slightly reduced probability
+        cfg.morse.bandpass_probability = 0.60
         cfg.morse.bandpass_bw_min = 200.0
         cfg.morse.bandpass_bw_max = 500.0
         cfg.morse.bandpass_order_min = 4
@@ -550,6 +563,8 @@ def create_default_config(scenario: str = "clean") -> Config:
         cfg.morse.multi_op_probability = 0.15
         cfg.morse.multi_op_speed_change_min = 0.7
         cfg.morse.multi_op_speed_change_max = 1.4
+        # Input gain: ±12 dB log-uniform per sample
+        cfg.morse.input_gain_db_range = (-12.0, 12.0)
 
     else:
         raise ValueError(

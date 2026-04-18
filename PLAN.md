@@ -7,9 +7,9 @@
 **The goal:** Build a new model that processes audio **causally** (left-to-right, no bidirectional attention) with **state carry-forward** between chunks, eliminating window stitching entirely. The model should:
 
 1. **Decode in real-time** as audio streams in, using only past context (fully causal attention and convolution). No frame ever sees future audio.
-2. **Avoid premature character commitment** by using a decode-time lookahead of up to 2 seconds. Many Morse characters share common element prefixes (E=`.`, I=`..`, S=`...`, H=`....`, 5=`.....`). The decoder must wait to see a confident **inter-character space (ICS)** — not just an inter-element space (IES) — before emitting a character. The model learns this naturally via CTC blank tokens, and the emission logic enforces it with a configurable commitment delay.
+2. **Emit characters as soon as greedy CTC decodes them.** The original plan called for a commitment delay (wait for inter-character space before emitting), but that turns out to be unnecessary: because the model is fully causal, greedy CTC decode of a prefix is always a correct prefix of the full decode. Past output never changes as more audio arrives. The implementation just re-decodes the accumulated log-probs on every chunk; characters emit the moment their frame's argmax stabilizes (which the model learns via CTC blanks). See `neural_decoder/inference_cwformer.py` for the current behavior.
 3. **Achieve comparable accuracy** to the current bidirectional model. Expected: 1-3% CER increase from the causal constraint at moderate SNR, offset by eliminating stitching artifacts (net real-world accuracy should improve).
-4. **Keep total latency under 2.5 seconds** from audio input to character emission. The budget breaks down as: audio chunk accumulation (~200ms-1s) + model processing (~50ms) + commitment delay (wait for ICS, up to ~2s depending on character and speed).
+4. **Keep total latency low** — chunk size + model processing. With a 500 ms chunk and ~30 ms CPU compute, end-to-end latency is about 530 ms. No commitment delay is added.
 5. **Preserve the training infrastructure** that works well: synthetic data generation with all augmentations, CTC loss, AMP, SpecAugment, cosine LR with warmup, curriculum learning (clean -> moderate -> full), gradient accumulation, data buffering.
 6. **Preserve the deployment pipeline**: ONNX export (INT8 quantized), pure-numpy inference without PyTorch, live audio device/stdin/file input.
 7. **Enable fine-tuning** from the existing bidirectional checkpoint (weights are shape-compatible) rather than requiring training from scratch.
@@ -24,15 +24,11 @@
 
 **Why fully causal works for Morse:** Unlike speech (where coarticulation makes future context critical), Morse characters are naturally delimited by silence gaps. Human operators decode CW left-to-right. The model will learn to emit CTC blanks during a character and commit when it sees the inter-character gap — the same strategy used by human decoders. The conv module's 620ms receptive field captures complete character patterns locally.
 
-**The commitment delay (ICS confirmation):** The model processes audio causally and produces CTC log_probs per frame. But we deliberately delay emitting decoded characters until the inter-character space is confirmed. Timing analysis:
-- At 20 WPM: dit=60ms, dah=180ms, IES=60ms, ICS=180ms. Longest char "0" (~1s) + ICS = ~1.2s. Well within 2s.
-- At 40 WPM: dit=30ms, dah=90ms, IES=30ms, ICS=90ms. Longest char ~0.5s + ICS = ~0.6s.
-- At 10 WPM: dit=120ms, dah=360ms, IES=120ms, ICS=360ms. Longest char ~2s + ICS = ~2.4s. Near the limit.
-The 2s commitment window covers the primary speed range (15-40 WPM) comfortably. At very slow speeds (5-10 WPM), the commitment delay may occasionally exceed 2s for the longest characters; this is acceptable given the naturally slower pace.
+**No commitment delay:** An earlier draft of this plan called for an ICS-confirmation delay of up to ~2 s before emitting each character, to avoid committing to a shared-prefix character (E/I/S/H/5 all start with a dit) before enough context had arrived. The final implementation does not use one. For a fully causal model with greedy CTC, past output is a function of past audio alone — once a frame's argmax is the first non-blank token of a character, nothing the model sees later can change the already-emitted prefix. The decoder just re-decodes the accumulated log-probs each chunk and diffs against what was already emitted; the model's own CTC blanks learn to stall on ambiguous prefixes (`.` remains blank-heavy until the model sees whether a second dit follows).
 
 **Expected accuracy impact:** 1-3% CER increase at moderate SNR (10-30 dB), 3-5% at low SNR (5-10 dB) vs fully bidirectional. Net real-world accuracy should still **improve** because stitching artifacts (the current biggest problem) are eliminated entirely.
 
-**Latency:** Configurable via chunk size and commitment delay. Default: 200ms-1s processing chunks + up to 2s commitment delay = well within 2.5s budget.
+**Latency:** Configurable via chunk size alone. A 500 ms chunk yields ~530 ms end-to-end latency on desktop CPU (audio accumulation + model forward). No commitment delay is added.
 
 ---
 
@@ -318,23 +314,21 @@ class CWFormerStreamingDecoder:
 7. Run greedy decode on recent CTC buffer to detect newly committed characters
 8. Emit new characters; update all state
 
-**Character emission logic (ICS-confirmed commitment):**
+**Character emission logic (no commitment delay):**
 
-The core principle: never emit a character until the inter-character space (ICS) after it is confirmed. Many Morse characters share element prefixes (E=`.`, I=`..`, S=`...`, H=`....`, 5=`.....`). Emitting "E" after seeing a single dit would be premature — we must wait for a gap long enough to be an ICS (3 dit-lengths), not just an IES (1 dit-length).
+The implementation emits characters as soon as greedy CTC decode produces them — there is no explicit commitment horizon. The reasoning:
+
+- The model is fully causal, so a CTC frame at time `t` is a deterministic function of audio `[0, t]`. More audio arriving at time `> t` cannot change the argmax at frame `t`.
+- Greedy CTC decode of a prefix is therefore always a correct prefix of the full decode. If the decoder emits "E" at chunk boundary `k`, that "E" stays in the transcript regardless of what follows.
+- The model learns to stall on ambiguous prefixes on its own: after a single dit, the CTC output remains blank-heavy until the model sees whether a second dit follows. "E" only becomes the argmax after the inter-character space has arrived in the frame's left-context — i.e., the model implements ICS-confirmation in its weights, not in an external delay loop.
 
 Implementation:
-- Maintain a running CTC log_prob buffer and the full greedy decode history
-- After each processing chunk, run greedy CTC decode on the full log_prob buffer
-- Track a "commitment horizon": the position in the CTC output that is `commitment_delay` frames behind the current frame (default: up to 2 seconds = ~100 CTC frames)
-- Characters decoded at positions BEFORE the commitment horizon are considered stable and emitted
-- Characters at or after the horizon are provisional — they may change as more audio arrives
-- The commitment delay allows the model to:
-  1. See the complete character elements (all dits/dahs)
-  2. See the ICS that follows (confirming the character boundary)
-  3. Resolve ambiguous prefixes (E vs I vs S vs H vs 5) by observing whether more elements follow
-- In practice, the model's CTC blanks naturally align with ICS boundaries — the commitment delay is a safety margin that ensures the blank-to-character transition is real, not a false positive from noise
+- Maintain a running CTC log_prob buffer.
+- After each processing chunk, run greedy CTC decode on the full accumulated buffer.
+- Diff against what was already emitted — new suffix is the "newly decoded characters" return value.
+- This is `O(T²)` total decode work across a session, but each decode is cheap (greedy argmax over ~50 fps × num_classes).
 
-The `commitment_delay` is configurable (default ~2s). At faster WPM, characters resolve much sooner than 2s; the delay is the maximum wait, not the typical wait. At 25 WPM, most characters commit within 0.5-1s.
+Latency = chunk accumulation + model compute only.
 
 **KV cache trimming:** When `pos_offset` exceeds `max_cache_len` (default 1500 = 30s), slice oldest frames from all KV caches: `k_cache = k_cache[:, :, -max_cache_len:, :]`. Position counter continues incrementing — RoPE handles this correctly since cached K vectors already have their absolute positions encoded.
 

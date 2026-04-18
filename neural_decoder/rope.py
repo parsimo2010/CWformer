@@ -66,11 +66,22 @@ class RotaryEmbedding(nn.Module):
     """Rotary Position Embedding module.
 
     Precomputes cos/sin tables and applies them to query/key tensors.
+    Tables auto-extend when asked for positions past the current max so
+    long streaming sessions (where pos_offset grows while KV cache stays
+    bounded) don't silently truncate the RoPE slice.
     """
 
     def __init__(self, dim: int, max_len: int = 4096, theta: float = 10000.0):
         super().__init__()
-        cos, sin = _precompute_freqs(dim, max_len, theta)
+        self.dim = dim
+        self.theta = theta
+        self._build_tables(max_len)
+
+    def _build_tables(self, max_len: int) -> None:
+        cos, sin = _precompute_freqs(self.dim, max_len, self.theta)
+        if hasattr(self, "cos"):
+            cos = cos.to(device=self.cos.device, dtype=self.cos.dtype)
+            sin = sin.to(device=self.sin.device, dtype=self.sin.dtype)
         self.register_buffer("cos", cos, persistent=False)
         self.register_buffer("sin", sin, persistent=False)
 
@@ -86,4 +97,10 @@ class RotaryEmbedding(nn.Module):
         -------
         (q_rotated, k_rotated), same shapes.
         """
+        needed = offset + q.shape[-2]
+        if needed > self.cos.shape[0]:
+            new_len = self.cos.shape[0]
+            while new_len < needed:
+                new_len *= 2
+            self._build_tables(new_len)
         return apply_rope(q, self.cos, self.sin, offset), apply_rope(k, self.cos, self.sin, offset)

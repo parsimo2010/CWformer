@@ -1139,6 +1139,17 @@ def generate_sample(
     if peak > 1e-9:
         audio_f32 = (audio_f32 * (target_amplitude / peak)).astype(np.float32)
 
+    # ---- Random input gain (post-normalisation) -------------------------
+    # Simulates non-peak-normalised input at inference time. Drawn
+    # log-uniformly in dB, applied as a linear gain, then clipped to the
+    # valid float32 audio range. Disabled by default ((0.0, 0.0)).
+    lo, hi = config.input_gain_db_range
+    if lo != 0.0 or hi != 0.0:
+        gain_db = rng.uniform(lo, hi)
+        gain_lin = 10.0 ** (gain_db / 20.0)
+        audio_f32 = (audio_f32 * gain_lin).astype(np.float32)
+        np.clip(audio_f32, -1.0, 1.0, out=audio_f32)
+
     metadata: Dict = {
         "wpm": wpm,
         "snr_db": snr_db,

@@ -33,6 +33,7 @@ import argparse
 import csv
 import math
 import os
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -273,10 +274,42 @@ def train(args: argparse.Namespace) -> None:
         if not is_rocm:
             torch.set_float32_matmul_precision('high')
 
-    # ---- Config ----
-    config = create_default_config(args.scenario)
+    # ---- Auto-curriculum setup ----
+    # When --auto-curriculum is set, distribute the total epoch budget across
+    # the three stages (clean/moderate/full) proportionally. Each stage still
+    # plateau-exits early if converged. If the user didn't supply --epochs,
+    # default to a 650-epoch ceiling.
+    CURRICULUM_ORDER = ("clean", "moderate", "full")
+    CURRICULUM_FRACTIONS = {"clean": 0.25, "moderate": 0.30, "full": 0.45}
+    current_scenario = args.scenario
 
-    if args.epochs is not None:
+    if args.auto_curriculum:
+        if current_scenario not in CURRICULUM_ORDER:
+            print(f"WARNING: --auto-curriculum requires starting scenario in "
+                  f"{CURRICULUM_ORDER}; got '{current_scenario}'. Falling back "
+                  f"to 'clean'.", file=sys.stderr)
+            current_scenario = "clean"
+        overall_budget = args.epochs if args.epochs is not None else 650
+        # Fraction of the overall budget allocated to each stage.  Unused
+        # stage allocations (e.g. if we start mid-curriculum) are ignored.
+        stage_budgets = {
+            s: max(1, int(round(overall_budget * CURRICULUM_FRACTIONS[s])))
+            for s in CURRICULUM_ORDER
+        }
+        print(f"Auto-curriculum enabled. Overall budget: {overall_budget} epochs. "
+              f"Per-stage caps: "
+              + ", ".join(f"{s}={stage_budgets[s]}" for s in CURRICULUM_ORDER))
+        print(f"  patience={args.curriculum_patience}, "
+              f"min_delta={args.curriculum_min_delta}, "
+              f"min_epochs={args.curriculum_min_epochs}")
+
+    # ---- Config ----
+    config = create_default_config(current_scenario)
+
+    if args.auto_curriculum:
+        # Per-stage epoch cap overrides config.training.num_epochs.
+        config.training.num_epochs = stage_budgets[current_scenario]
+    elif args.epochs is not None:
         config.training.num_epochs = args.epochs
 
     # ---- Model config ----
@@ -316,6 +349,7 @@ def train(args: argparse.Namespace) -> None:
     # ---- Load checkpoint if resuming ----
     start_epoch = 0
     best_val_loss = float("inf")
+    best_greedy_cer = float("inf")
     ckpt = None
     if args.checkpoint and Path(args.checkpoint).exists():
         print(f"Loading checkpoint: {args.checkpoint}")
@@ -327,13 +361,19 @@ def train(args: argparse.Namespace) -> None:
         if "epoch" in ckpt:
             start_epoch = ckpt["epoch"] + 1
         prev_scenario = ckpt.get("scenario", "")
-        if prev_scenario == args.scenario and "best_val_loss" in ckpt:
-            best_val_loss = ckpt["best_val_loss"]
+        if prev_scenario == current_scenario:
+            best_val_loss = ckpt.get("best_val_loss", float("inf"))
+            # best_greedy_cer is a new field; fall back to inf so the next
+            # eval registers a new best selected by CER regardless of what
+            # the old best_model.pt held (it was chosen by val_loss).
+            best_greedy_cer = ckpt.get("best_greedy_cer", float("inf"))
         else:
-            best_val_loss = float("inf")
-            if prev_scenario and prev_scenario != args.scenario:
-                print(f"  Scenario changed ({prev_scenario} -> {args.scenario}), resetting best_val_loss")
-        print(f"  Resuming from epoch {start_epoch}, best_val_loss={best_val_loss:.4f}")
+            if prev_scenario:
+                print(f"  Scenario changed ({prev_scenario} -> {current_scenario}), "
+                      f"resetting best metrics")
+        print(f"  Resuming from epoch {start_epoch}, "
+              f"best_val_loss={best_val_loss:.4f}, "
+              f"best_greedy_cer={best_greedy_cer:.4f}")
 
     # ---- Optimizer + scheduler ----
     optimizer = torch.optim.AdamW(
@@ -352,12 +392,14 @@ def train(args: argparse.Namespace) -> None:
             optimizer.load_state_dict(ckpt["optimizer_state_dict"])
 
         warmup_epochs = min(5, max(1, total_epochs // 40))
+        lr_floor = args.lr_floor
 
         def lr_lambda(epoch: int) -> float:
             if epoch < warmup_epochs:
                 return (epoch + 1) / warmup_epochs
             progress = (epoch - warmup_epochs) / max(1, total_epochs - warmup_epochs)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(lr_floor, cosine)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -378,12 +420,14 @@ def train(args: argparse.Namespace) -> None:
 
         remaining_epochs = total_epochs - start_epoch
         warmup_epochs = min(5, max(1, remaining_epochs // 40))
+        lr_floor = args.lr_floor
 
         def lr_lambda(epoch: int) -> float:
             if epoch < warmup_epochs:
                 return (epoch + 1) / warmup_epochs
             progress = (epoch - warmup_epochs) / max(1, remaining_epochs - warmup_epochs)
-            return 0.5 * (1.0 + math.cos(math.pi * progress))
+            cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return max(lr_floor, cosine)
 
         scheduler = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
@@ -399,43 +443,54 @@ def train(args: argparse.Namespace) -> None:
     # ---- Datasets ----
     # Audio generation is CPU-bound — use smaller batches and fewer samples
     samples_per_epoch = min(config.training.samples_per_epoch, 20000)
-    val_samples = min(config.training.val_samples, 2000)
+    val_samples = min(config.training.val_samples, 5000)
 
     micro_batch = args.batch_size
     effective_batch = 64  # Target effective batch for audio
     accum_steps = max(1, effective_batch // micro_batch)
 
-    train_ds = AudioDataset(
-        config, epoch_size=samples_per_epoch, seed=None,
-        qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
-    )
-    val_ds = AudioDataset(
-        config, epoch_size=val_samples, seed=None,  # fresh samples each eval
-        qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
-    )
-
     num_workers = args.workers
     reuse_factor = args.reuse_factor
 
-    # For reuse_factor==1 keep the persistent streaming loader (current behaviour).
-    # For reuse_factor>1 we generate batches into RAM and replay them.
-    if reuse_factor <= 1:
-        train_loader = DataLoader(
-            train_ds, batch_size=micro_batch, collate_fn=collate_fn,
-            num_workers=num_workers, pin_memory=use_pin_memory,
-            prefetch_factor=4 if num_workers > 0 else None,
-            persistent_workers=num_workers > 0,
+    def _build_dataloaders(cfg: Config):
+        """Construct train/val datasets and loaders for the given scenario cfg.
+
+        Called once up-front and again on each auto-curriculum stage advance so
+        the new scenario's MorseConfig (SNR, WPM, augmentations) takes effect.
+        Returns (train_ds, val_ds, train_loader or None, val_loader).
+        train_loader is None when reuse_factor > 1 (the buffer path owns its
+        own loader inside the epoch body).
+        """
+        _train_ds = AudioDataset(
+            cfg, epoch_size=samples_per_epoch, seed=None,
+            qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
         )
-    val_loader = DataLoader(
-        val_ds, batch_size=micro_batch, collate_fn=collate_fn,
-        num_workers=min(num_workers, 4), pin_memory=use_pin_memory,
-        prefetch_factor=4 if num_workers > 0 else None,
-        persistent_workers=min(num_workers, 4) > 0,
-    )
+        _val_ds = AudioDataset(
+            cfg, epoch_size=val_samples, seed=None,  # fresh samples each eval
+            qso_text_ratio=0.5, max_audio_sec=args.max_audio_sec,
+        )
+        _train_loader = None
+        if reuse_factor <= 1:
+            _train_loader = DataLoader(
+                _train_ds, batch_size=micro_batch, collate_fn=collate_fn,
+                num_workers=num_workers, pin_memory=use_pin_memory,
+                prefetch_factor=4 if num_workers > 0 else None,
+                persistent_workers=num_workers > 0,
+            )
+        _val_loader = DataLoader(
+            _val_ds, batch_size=micro_batch, collate_fn=collate_fn,
+            num_workers=min(num_workers, 4), pin_memory=use_pin_memory,
+            prefetch_factor=4 if num_workers > 0 else None,
+            persistent_workers=min(num_workers, 4) > 0,
+        )
+        return _train_ds, _val_ds, _train_loader, _val_loader
+
+    train_ds, val_ds, train_loader, val_loader = _build_dataloaders(config)
 
     # ---- CSV log ----
     log_path = ckpt_dir / "training_log.csv"
-    log_fields = ["epoch", "train_loss", "val_loss", "greedy_cer", "beam_cer", "lr", "time_s"]
+    log_fields = ["epoch", "train_loss", "train_entropy", "val_loss",
+                  "greedy_cer", "beam_cer", "lr", "time_s"]
     if not log_path.exists() or start_epoch == 0:
         with open(log_path, "w", newline="") as f:
             csv.writer(f).writerow(log_fields)
@@ -450,7 +505,7 @@ def train(args: argparse.Namespace) -> None:
     print(f"\nTraining: {total_epochs} epochs, {samples_per_epoch} samples/epoch, "
           f"micro_batch={micro_batch}, accum={accum_steps} (effective={micro_batch*accum_steps}), "
           f"workers={num_workers}{reuse_str}")
-    print(f"Scenario: {args.scenario}"
+    print(f"Scenario: {current_scenario}"
           + (f", cache_dir={cache_dir}" if cache_dir else ""))
 
     # Buffer state for reuse_factor > 1.
@@ -477,7 +532,18 @@ def train(args: argparse.Namespace) -> None:
     # Disk-cache state
     _buffer_gen: int = -1
 
-    for epoch in range(start_epoch, total_epochs):
+    # ---- Auto-curriculum plateau tracking ----
+    # Epochs elapsed since the current stage started (independent of the
+    # global epoch counter because we preserve the global counter across
+    # stages so logs / checkpoints stay monotonic).
+    epochs_in_stage = 0
+    # Epochs since best_greedy_cer last improved by >= curriculum_min_delta.
+    epochs_since_improvement = 0
+    # Global flag to exit the epoch loop cleanly when full-stage plateau hits.
+    training_complete = False
+
+    epoch = start_epoch
+    while epoch < total_epochs:
         t0 = time.time()
         model.train()
         total_train_loss = 0.0
@@ -563,6 +629,7 @@ def train(args: argparse.Namespace) -> None:
         optimizer.zero_grad(set_to_none=True)
         micro_step = 0
         running_loss = torch.tensor(0.0, device=device)
+        running_entropy = torch.tensor(0.0, device=device, dtype=torch.float32)
 
         for audio, targets, audio_lens, target_lens, texts in pbar:
             audio = audio.to(device, non_blocking=True)
@@ -578,18 +645,41 @@ def train(args: argparse.Namespace) -> None:
                 # infeasible paths without needing a GPU-syncing .all() check.
                 out_lens = out_lens.clamp(min=1)
 
-                loss = ctc_loss_fn(log_probs, targets, out_lens, target_lens)
-                loss = loss / accum_steps
+                ctc_loss = ctc_loss_fn(log_probs, targets, out_lens, target_lens)
+
+                # Confidence penalty (Pereyra et al. 2017): maximize predictive
+                # entropy to counter late-training overconfidence.  Train-only;
+                # val_loss stays pure CTC for interpretability.
+                if args.confidence_penalty > 0.0:
+                    T_max = log_probs.shape[0]
+                    probs = log_probs.exp()
+                    entropy_per_frame = -(probs * log_probs).sum(dim=-1)  # (T, B)
+                    mask = (torch.arange(T_max, device=log_probs.device)
+                            .unsqueeze(1) < out_lens.unsqueeze(0))
+                    n_valid = mask.sum().clamp(min=1).to(entropy_per_frame.dtype)
+                    mean_entropy = (entropy_per_frame * mask).sum() / n_valid
+                    total_loss = ctc_loss - args.confidence_penalty * mean_entropy
+                else:
+                    mean_entropy = None
+                    total_loss = ctc_loss
+
+                total_loss = total_loss / accum_steps
 
             # No isnan/isinf check — GradScaler already skips optimizer
             # steps when gradients contain inf/nan.  Checking here would
             # force a CPU-GPU sync on every micro-step.
 
-            scaler.scale(loss).backward()
+            scaler.scale(total_loss).backward()
 
-            # Accumulate loss on GPU to avoid .item() sync every micro-step
-            running_loss += loss.detach() * accum_steps
-            del audio, targets, audio_lens, target_lens, log_probs, out_lens, loss
+            # Accumulate raw CTC loss (not the penalized total) so train_loss
+            # in the log is directly comparable to val_loss.
+            running_loss += ctc_loss.detach()
+            if mean_entropy is not None:
+                running_entropy += mean_entropy.detach().to(running_entropy.dtype)
+            del audio, targets, audio_lens, target_lens, log_probs, out_lens
+            del ctc_loss, total_loss
+            if mean_entropy is not None:
+                del mean_entropy
 
             micro_step += 1
 
@@ -615,6 +705,10 @@ def train(args: argparse.Namespace) -> None:
 
         # Single GPU→CPU sync per epoch for loss logging (not per micro-step)
         avg_train_loss = running_loss.item() / max(1, n_batches)
+        if args.confidence_penalty > 0.0:
+            avg_train_entropy = running_entropy.item() / max(1, n_batches)
+        else:
+            avg_train_entropy = None
         current_lr = optimizer.param_groups[0]["lr"]
 
         # ---- Validation ----
@@ -635,12 +729,16 @@ def train(args: argparse.Namespace) -> None:
               f"train={avg_train_loss:.4f} val={val_loss:.4f} | "
               f"CER={greedy_cer:.3f}"
               + (f" beam={beam_cer:.3f}" if beam_cer >= 0 else "")
+              + (f" | H={avg_train_entropy:.3f}" if avg_train_entropy is not None else "")
               + f" | lr={current_lr:.2e} | {elapsed:.0f}s")
 
         # ---- CSV log ----
         with open(log_path, "a", newline="") as f:
             csv.writer(f).writerow([
-                epoch + 1, f"{avg_train_loss:.6f}", f"{val_loss:.6f}",
+                epoch + 1,
+                f"{avg_train_loss:.6f}",
+                f"{avg_train_entropy:.6f}" if avg_train_entropy is not None else "",
+                f"{val_loss:.6f}",
                 f"{greedy_cer:.6f}", f"{beam_cer:.6f}" if beam_cer >= 0 else "",
                 f"{current_lr:.2e}", f"{elapsed:.1f}",
             ])
@@ -654,7 +752,8 @@ def train(args: argparse.Namespace) -> None:
             "val_loss": val_loss,
             "best_val_loss": min(best_val_loss, val_loss),
             "greedy_cer": greedy_cer,
-            "scenario": args.scenario,
+            "best_greedy_cer": min(best_greedy_cer, greedy_cer),
+            "scenario": current_scenario,
             "total_epochs": total_epochs,
             "model_config": {
                 "d_model": conformer_cfg.d_model,
@@ -676,16 +775,168 @@ def train(args: argparse.Namespace) -> None:
         # Safety checkpoint (overwritten each epoch)
         torch.save(ckpt_data, ckpt_dir / "latest_model.pt")
 
-        # Best model
+        # Track running bests for both metrics
         if val_loss < best_val_loss:
             best_val_loss = val_loss
-            ckpt_data["best_val_loss"] = best_val_loss
+
+        # Best model selected by greedy CER (the real objective).  val_loss
+        # is tracked separately and saved in the checkpoint for reference.
+        improved_this_epoch = False
+        if greedy_cer < best_greedy_cer - (args.curriculum_min_delta
+                                           if args.auto_curriculum else 0.0):
+            improved_this_epoch = True
+        if greedy_cer < best_greedy_cer:
+            best_greedy_cer = greedy_cer
+            ckpt_data["best_greedy_cer"] = best_greedy_cer
             torch.save(ckpt_data, ckpt_dir / "best_model.pt")
-            print(f"  * New best model (val_loss={val_loss:.4f})")
+            print(f"  * New best model (greedy_cer={greedy_cer:.4f}, val_loss={val_loss:.4f})")
 
         # Periodic checkpoint every 10 epochs
         if (epoch + 1) % 10 == 0:
             torch.save(ckpt_data, ckpt_dir / f"checkpoint_epoch{epoch+1}.pt")
+
+        # ---- Auto-curriculum plateau check ----
+        epochs_in_stage += 1
+        if args.auto_curriculum:
+            if improved_this_epoch:
+                epochs_since_improvement = 0
+            else:
+                epochs_since_improvement += 1
+
+            plateau_hit = (
+                epochs_in_stage >= args.curriculum_min_epochs
+                and epochs_since_improvement >= args.curriculum_patience
+            )
+
+            if plateau_hit:
+                if current_scenario in ("clean", "moderate"):
+                    # ---- Advance to the next stage ----
+                    next_scenario = CURRICULUM_ORDER[
+                        CURRICULUM_ORDER.index(current_scenario) + 1
+                    ]
+                    # Save current stage best as best_model_{stage}.pt
+                    stage_best_src = ckpt_dir / "best_model.pt"
+                    stage_best_dst = ckpt_dir / f"best_model_{current_scenario}.pt"
+                    if stage_best_src.exists():
+                        shutil.copyfile(stage_best_src, stage_best_dst)
+
+                    banner = "=" * 72
+                    reason = (
+                        f"plateau: no >= {args.curriculum_min_delta:.4f} "
+                        f"CER improvement in {epochs_since_improvement} epochs "
+                        f"(stage ran {epochs_in_stage} epochs, "
+                        f"min={args.curriculum_min_epochs})"
+                    )
+                    print(f"\n{banner}")
+                    print(f"AUTO-CURRICULUM: ADVANCING TO {next_scenario.upper()}")
+                    print(f"  from: {current_scenario} (saved "
+                          f"{stage_best_dst.name})")
+                    print(f"  reason: {reason}")
+                    print(f"  best_greedy_cer at transition: {best_greedy_cer:.4f}")
+                    print(f"{banner}\n", flush=True)
+
+                    # Reload model weights from the just-saved stage best
+                    # so the new stage starts from the best of the prior one.
+                    if stage_best_dst.exists():
+                        sd = torch.load(stage_best_dst, map_location=device,
+                                        weights_only=False)
+                        if "model_state_dict" in sd:
+                            model.load_state_dict(sd["model_state_dict"], strict=False)
+                        else:
+                            model.load_state_dict(sd, strict=False)
+                        del sd
+
+                    # Switch scenario and rebuild config + datasets/loaders.
+                    current_scenario = next_scenario
+                    config = create_default_config(current_scenario)
+                    # Per-stage epoch cap becomes the ceiling for the new stage.
+                    stage_cap = stage_budgets[current_scenario]
+                    # Grow total_epochs so the new stage has its full budget
+                    # starting from the current epoch counter.
+                    total_epochs = (epoch + 1) + stage_cap
+                    config.training.num_epochs = total_epochs
+                    # Rebuild datasets/loaders with the new scenario's MorseConfig.
+                    train_ds, val_ds, train_loader, val_loader = _build_dataloaders(config)
+
+                    # Reset buffer state so any reuse_factor buffers start
+                    # fresh under the new scenario distribution.
+                    _buffer = []
+                    _phase = "fill"
+                    _fill_count = 0
+                    _replay_count = 0
+                    _batches_per_epoch = 0
+                    _buffer_gen = -1
+
+                    # Reset LR schedule to a fresh cosine warmup -> floor over
+                    # the remaining epochs.  Preserve optimizer momentum
+                    # buffers; just reset the per-param-group LR and rebuild
+                    # the LambdaLR so progress starts at 0 again.
+                    for pg in optimizer.param_groups:
+                        pg["lr"] = args.lr
+                        pg.pop("initial_lr", None)
+                    remaining_epochs = total_epochs - (epoch + 1)
+                    warmup_epochs = min(5, max(1, remaining_epochs // 40))
+                    lr_floor = args.lr_floor
+
+                    def lr_lambda_stage(e_in_stage: int,
+                                        _rem=remaining_epochs,
+                                        _warm=warmup_epochs,
+                                        _floor=lr_floor) -> float:
+                        if e_in_stage < _warm:
+                            return (e_in_stage + 1) / _warm
+                        progress = (e_in_stage - _warm) / max(1, _rem - _warm)
+                        cosine = 0.5 * (1.0 + math.cos(math.pi * progress))
+                        return max(_floor, cosine)
+
+                    scheduler = torch.optim.lr_scheduler.LambdaLR(
+                        optimizer, lr_lambda_stage
+                    )
+
+                    # Reset stage trackers.
+                    best_greedy_cer = float("inf")
+                    best_val_loss = float("inf")
+                    epochs_in_stage = 0
+                    epochs_since_improvement = 0
+
+                    print(f"Scenario: {current_scenario} "
+                          f"(stage budget {stage_cap} epochs, "
+                          f"total_epochs now {total_epochs})")
+                else:
+                    # ---- full scenario plateau: training is done ----
+                    banner = "=" * 72
+                    reason = (
+                        f"plateau in full stage: no >= "
+                        f"{args.curriculum_min_delta:.4f} CER improvement "
+                        f"in {epochs_since_improvement} epochs "
+                        f"(stage ran {epochs_in_stage} epochs, "
+                        f"min={args.curriculum_min_epochs})"
+                    )
+                    print(f"\n{banner}")
+                    print(f"AUTO-CURRICULUM: TRAINING COMPLETE")
+                    print(f"  final stage: {current_scenario}")
+                    print(f"  reason: {reason}")
+                    print(f"  final best_greedy_cer: {best_greedy_cer:.4f}")
+                    print(f"{banner}\n", flush=True)
+
+                    # Ensure best_model_full.pt exists as well, for symmetry.
+                    stage_best_src = ckpt_dir / "best_model.pt"
+                    stage_best_dst = ckpt_dir / f"best_model_{current_scenario}.pt"
+                    if stage_best_src.exists():
+                        shutil.copyfile(stage_best_src, stage_best_dst)
+
+                    marker_path = ckpt_dir / "training_complete.txt"
+                    with open(marker_path, "w") as f:
+                        f.write(
+                            f"scenario={current_scenario}\n"
+                            f"final_epoch={epoch + 1}\n"
+                            f"best_greedy_cer={best_greedy_cer:.6f}\n"
+                            f"reason={reason}\n"
+                        )
+                    training_complete = True
+
+        epoch += 1
+        if training_complete:
+            break
 
     print(f"\nTraining complete. Best val_loss: {best_val_loss:.4f}")
 
@@ -715,17 +966,25 @@ def main():
     parser.add_argument("--n-heads", type=int, default=4)
     parser.add_argument("--n-layers", type=int, default=12)
     parser.add_argument("--d-ff", type=int, default=1024)
-    parser.add_argument("--conv-kernel", type=int, default=31)
+    parser.add_argument("--conv-kernel", type=int, default=63)
     parser.add_argument("--dropout", type=float, default=0.1)
 
     # Training
     parser.add_argument("--lr", type=float, default=3e-4,
                         help="Peak learning rate")
+    parser.add_argument("--lr-floor", type=float, default=0.05, dest="lr_floor",
+                        help="Minimum LR as a fraction of peak (floors the cosine "
+                             "schedule). Default 0.05 = 5%% of peak LR.")
+    parser.add_argument("--confidence-penalty", type=float, default=0.1,
+                        dest="confidence_penalty",
+                        help="CTC confidence-penalty weight (Pereyra et al. 2017). "
+                             "Adds -beta*H(p) to the training loss to counter late-"
+                             "training overconfidence. 0.0 disables. Default 0.1.")
     parser.add_argument("--batch-size", type=int, default=8,
                         help="Micro-batch size (gradient accumulation to effective ~64)")
     parser.add_argument("--workers", type=int, default=min(8, os.cpu_count() or 4),
                         help="DataLoader workers (default: min(8, cpu_count))")
-    parser.add_argument("--max-audio-sec", type=float, default=15.0,
+    parser.add_argument("--max-audio-sec", type=float, default=30.0,
                         help="Max audio duration per sample (seconds)")
     parser.add_argument("--reuse-factor", type=int, default=1, dest="reuse_factor",
                         help="Replay each generated data buffer this many times before "
@@ -743,6 +1002,29 @@ def main():
                              "Batches are written as .pt files and reused across "
                              "replay passes; cleaned up before each refill. "
                              "Example: --cache-dir /tmp/cwformer_cache")
+
+    # Auto-curriculum progression (clean -> moderate -> full)
+    parser.add_argument("--auto-curriculum", action="store_true",
+                        dest="auto_curriculum",
+                        help="Automatically advance through scenarios clean -> "
+                             "moderate -> full on plateau. Saves best_model_<stage>.pt "
+                             "at each transition and writes training_complete.txt "
+                             "when the full stage converges.")
+    parser.add_argument("--curriculum-patience", type=int, default=25,
+                        dest="curriculum_patience",
+                        help="Auto-curriculum: epochs of no best_greedy_cer "
+                             "improvement before advancing to the next stage. "
+                             "Default 25.")
+    parser.add_argument("--curriculum-min-delta", type=float, default=0.003,
+                        dest="curriculum_min_delta",
+                        help="Auto-curriculum: minimum CER improvement required to "
+                             "reset the plateau patience counter. Default 0.003 "
+                             "(0.3 absolute-CER points).")
+    parser.add_argument("--curriculum-min-epochs", type=int, default=50,
+                        dest="curriculum_min_epochs",
+                        help="Auto-curriculum: minimum epochs a stage must run "
+                             "before plateau-based advancement is allowed. "
+                             "Default 50.")
 
     args = parser.parse_args()
     train(args)

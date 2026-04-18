@@ -34,7 +34,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 
-from neural_decoder.rope import RotaryEmbedding
+from neural_decoder.rope import RotaryEmbedding, apply_rope
 
 
 # ---------------------------------------------------------------------------
@@ -48,10 +48,10 @@ class ConformerConfig:
     n_heads: int = 4            # Attention heads (d_k = d_model / n_heads = 64)
     n_layers: int = 12          # Number of Conformer blocks
     d_ff: int = 1024            # Feed-forward inner dimension (4× d_model)
-    conv_kernel: int = 31       # Depthwise conv kernel size
+    conv_kernel: int = 63       # Depthwise conv kernel size
     dropout: float = 0.1        # Dropout rate
     max_seq_len: int = 4096     # Maximum sequence length for RoPE tables
-    max_cache_len: int = 1500   # Max KV cache frames (~30s at 50fps)
+    max_cache_len: int = 1475   # Max KV cache frames (~29.5s at 50fps; leaves 25-frame chunk headroom vs 1500-frame training max)
 
 
 # ---------------------------------------------------------------------------
@@ -197,16 +197,20 @@ class ConformerMHA(nn.Module):
 class ConvolutionModule(nn.Module):
     """Conformer convolution module with causal depthwise convolution.
 
-    LN → Pointwise(D→2D) → GLU → Causal DepthwiseConv(kernel) → BN → Swish
+    LN → Pointwise(D→2D) → GLU → Causal DepthwiseConv(kernel) → LN → Swish
     → Pointwise(D→D) → Dropout
 
     Causal: left-pad only (pad=kernel-1, 0). Each frame's output depends
-    only on itself and the (kernel-1) preceding frames (620ms at 50fps
-    with kernel=31). During streaming inference, a conv buffer carries
+    only on itself and the (kernel-1) preceding frames (1260ms at 50fps
+    with kernel=63). During streaming inference, a conv buffer carries
     the last (kernel-1) frames between chunks.
+
+    Uses LayerNorm (not BatchNorm) after the depthwise conv so per-frame
+    statistics are independent of batch composition and sequence length,
+    which matches the causal streaming inference regime.
     """
 
-    def __init__(self, d_model: int, conv_kernel: int = 31, dropout: float = 0.1):
+    def __init__(self, d_model: int, conv_kernel: int = 63, dropout: float = 0.1):
         super().__init__()
         self.layer_norm = nn.LayerNorm(d_model)
         self.conv_kernel = conv_kernel
@@ -222,7 +226,8 @@ class ConvolutionModule(nn.Module):
             padding=0,
             groups=d_model,
         )
-        self.batch_norm = nn.BatchNorm1d(d_model)
+        # LayerNorm over channel dim; input rearranged to (B, T, D) before norm.
+        self.layer_norm_conv = nn.LayerNorm(d_model)
 
         # Pointwise projection (D → D)
         self.pointwise2 = nn.Conv1d(d_model, d_model, kernel_size=1)
@@ -267,7 +272,12 @@ class ConvolutionModule(nn.Module):
             new_conv_buffer = None
 
         out = self.depthwise(depthwise_input)  # (B, D, T)
-        out = self.batch_norm(out)
+
+        # LayerNorm wants (B, T, D). Transpose in, norm, transpose back.
+        out = out.transpose(1, 2)   # (B, T, D)
+        out = self.layer_norm_conv(out)
+        out = out.transpose(1, 2)   # (B, D, T)
+
         out = F.silu(out)           # Swish
 
         # Pointwise projection
@@ -293,7 +303,7 @@ class ConformerBlock(nn.Module):
     """
 
     def __init__(self, d_model: int, n_heads: int, d_ff: int,
-                 conv_kernel: int = 31, dropout: float = 0.1,
+                 conv_kernel: int = 63, dropout: float = 0.1,
                  max_seq_len: int = 4096):
         super().__init__()
         self.ff1 = FeedForwardModule(d_model, d_ff, dropout)
@@ -305,7 +315,6 @@ class ConformerBlock(nn.Module):
     def forward(
         self,
         x: Tensor,
-        mask: Optional[Tensor] = None,
         kv_cache: Optional[tuple[Tensor, Tensor]] = None,
         conv_buffer: Optional[Tensor] = None,
         pos_offset: int = 0,
@@ -314,7 +323,6 @@ class ConformerBlock(nn.Module):
         Parameters
         ----------
         x : Tensor, shape (B, T, D)
-        mask : optional (unused, kept for API compatibility)
         kv_cache : optional (k, v) for streaming attention
         conv_buffer : optional conv state for streaming
         pos_offset : int, cumulative position for RoPE
@@ -324,13 +332,21 @@ class ConformerBlock(nn.Module):
         x : Tensor, shape (B, T, D)
         new_kv_cache : (k, v) or None
         new_conv_buffer : Tensor or None
+
+        Notes
+        -----
+        No `mask` parameter: causal attention handles future-frame
+        masking directly, and LayerNorm (in both FF modules and inside
+        the conv module) is per-frame, so padded frames don't
+        contaminate valid-frame statistics. An explicit padding mask is
+        unnecessary.
         """
         # Feed-forward half-step 1
         x = x + 0.5 * self.ff1(x)
 
         # Multi-head self-attention (causal)
         mha_out, new_kv_cache = self.mha(
-            x, mask=mask, kv_cache=kv_cache, pos_offset=pos_offset)
+            x, kv_cache=kv_cache, pos_offset=pos_offset)
         x = x + mha_out
 
         # Convolution module (causal)
@@ -379,7 +395,6 @@ class ConformerEncoder(nn.Module):
     def forward(
         self,
         x: Tensor,
-        mask: Optional[Tensor] = None,
         kv_caches: Optional[list[tuple[Tensor, Tensor]]] = None,
         conv_buffers: Optional[list[Tensor]] = None,
         pos_offset: int = 0,
@@ -388,7 +403,6 @@ class ConformerEncoder(nn.Module):
         Parameters
         ----------
         x : Tensor, shape (B, T, D)
-        mask : optional (unused, kept for API compatibility)
         kv_caches : list of N (k, v) tuples, or None (training)
         conv_buffers : list of N conv buffer tensors, or None (training)
         pos_offset : int, cumulative position for RoPE
@@ -398,6 +412,14 @@ class ConformerEncoder(nn.Module):
         x : Tensor, shape (B, T, D)
         new_kv_caches : list of (k, v) or None
         new_conv_buffers : list of Tensor or None
+
+        Notes
+        -----
+        No explicit `mask` parameter. Causal attention prevents valid
+        frames from attending to padded (future) positions, and
+        LayerNorm throughout the Conformer blocks is per-frame, so
+        padded frames don't affect valid-frame normalization. See
+        `ConformerBlock.forward` for the full rationale.
         """
         new_kv_caches = [] if kv_caches is not None else None
         new_conv_buffers = [] if conv_buffers is not None else None
@@ -407,7 +429,7 @@ class ConformerEncoder(nn.Module):
             cb_i = conv_buffers[i] if conv_buffers is not None else None
 
             x, new_kv, new_cb = layer(
-                x, mask=mask, kv_cache=kv_i, conv_buffer=cb_i,
+                x, kv_cache=kv_i, conv_buffer=cb_i,
                 pos_offset=pos_offset,
             )
 

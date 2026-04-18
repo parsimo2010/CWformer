@@ -66,11 +66,11 @@ def _build_vocab() -> Tuple[Dict[str, int], Dict[int, str]]:
     tokens: List[str] = (
         [BLANK_TOKEN]   # index 0 — CTC blank
         + [" "]          # index 1 — word-separator space
-        + LETTERS        # indices 2–27
-        + DIGITS         # indices 28–37
-        + PUNCTUATION    # indices 38–55
-        + PROSIGNS       # indices 56–63
-    )
+        + LETTERS        # indices 2–27  (26 letters)
+        + DIGITS         # indices 28–37 (10 digits)
+        + PUNCTUATION    # indices 38–45 (8 punctuation: .,?/(&=+)
+        + PROSIGNS       # indices 46–51 (6 prosigns: AR SK BT KN AS CT)
+    )   # total 52 classes (= 1 blank + 1 space + 26 + 10 + 8 + 6)
     c2i: Dict[str, int] = {tok: idx for idx, tok in enumerate(tokens)}
     i2c: Dict[int, str] = {idx: tok for idx, tok in enumerate(tokens)}
     return c2i, i2c

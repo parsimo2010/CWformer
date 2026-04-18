@@ -141,18 +141,26 @@ def _base_config() -> MorseConfig:
     mc.tone_drift = 5.0
     mc.rise_time_ms_min = 3.0
     mc.rise_time_ms_max = 8.0
-    # All augmentations OFF
+    # Most augmentations OFF — except bandpass, which is baseline because
+    # a real receiver always applies a CW filter. Pinned 250-600 Hz, order
+    # 4-8, which matches a typical amateur CW receiver.
     mc.agc_probability = 0.0
     mc.qsb_probability = 0.0
     mc.qrm_probability = 0.0
     mc.qrn_probability = 0.0
-    mc.bandpass_probability = 0.0
+    mc.bandpass_probability = 1.0
+    mc.bandpass_bw_min = 250.0
+    mc.bandpass_bw_max = 600.0
+    mc.bandpass_order_min = 4
+    mc.bandpass_order_max = 8
     mc.hf_noise_probability = 0.0
     mc.farnsworth_probability = 0.0
     mc.multi_op_probability = 0.0
     mc.speed_drift_max = 0.0
-    # Sample length
-    mc.min_chars = 80
+    # Sample length — long audio to match real-world deployment captures.
+    # At 35 WPM (highest tested): 30 s minimum => 88+ chars, round to 90.
+    # At 15 WPM (lowest tested): max 150 chars => 120 s, bounded.
+    mc.min_chars = 90
     mc.max_chars = 150
     return mc
 
@@ -214,16 +222,6 @@ AUGMENTATIONS = [
     ("QRN rate=5", {
         "qrn_probability": 1.0,
         "qrn_rate_min": 5.0, "qrn_rate_max": 5.0,
-    }),
-    ("BP 250 Hz", {
-        "bandpass_probability": 1.0,
-        "bandpass_bw_min": 250.0, "bandpass_bw_max": 250.0,
-        "bandpass_order_min": 6, "bandpass_order_max": 6,
-    }),
-    ("BP 400 Hz", {
-        "bandpass_probability": 1.0,
-        "bandpass_bw_min": 400.0, "bandpass_bw_max": 400.0,
-        "bandpass_order_min": 6, "bandpass_order_max": 6,
     }),
     ("Drift 8%", {
         "speed_drift_max": 0.08,
@@ -355,7 +353,7 @@ def main():
     # ==================================================================
     # Phase 1: Clean baseline (no augmentations)
     # ==================================================================
-    snr_levels = [-5, 0, 5, 10, 20, 30]
+    snr_levels = [30, 20, 10, 5, 0, -5]
     wpm_levels = [15, 20, 25, 30, 35]
     key_types = ["straight", "bug", "paddle", "cootie"]
 
