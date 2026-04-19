@@ -168,14 +168,34 @@ def _base_config() -> MorseConfig:
 def make_config(
     snr_db: float, wpm: float, key_type: str,
     aug_overrides: dict | None = None,
+    tight_timing: bool = False,
 ) -> MorseConfig:
-    """Build a config with pinned SNR/WPM/key_type and optional augmentation."""
+    """Build a config with pinned SNR/WPM/key_type and optional augmentation.
+
+    tight_timing=True narrows operator-style timing ranges (dah/dit,
+    ics, iws) around their nominal values. Used for the Phase 1/4 clean
+    baseline grid so wide-fist variance doesn't dominate sample-to-sample
+    CER noise. Phase 2/3 leave this at False so augmentation and
+    per-position sweeps still see realistic fist spread.
+
+    Nominal values:
+      dah_dit_ratio = 3.0 (ITU)
+      ics_factor    = 1.0 (ITU 3-dit inter-character gap)
+      iws_factor    = 1.0 (ITU 7-dit inter-word gap)
+    """
     mc = _base_config()
     mc.min_snr_db = snr_db
     mc.max_snr_db = snr_db
     mc.min_wpm = wpm
     mc.max_wpm = wpm
     mc.key_type_weights = KEY_WEIGHTS[key_type]
+    if tight_timing:
+        mc.dah_dit_ratio_min = 2.0
+        mc.dah_dit_ratio_max = 4.0
+        mc.ics_factor_min = 0.75
+        mc.ics_factor_max = 1.5
+        mc.iws_factor_min = 0.75
+        mc.iws_factor_max = 1.75
     if aug_overrides:
         for k, v in aug_overrides.items():
             setattr(mc, k, v)
@@ -236,6 +256,19 @@ AUGMENTATIONS = [
     ("Farnsworth 2.0x", {
         "farnsworth_probability": 1.0,
         "farnsworth_char_speed_min": 2.0, "farnsworth_char_speed_max": 2.0,
+    }),
+    # Bandpass width sweep — order pinned to 6 for both so the only
+    # variable is filter bandwidth. Baseline uses bw ∈ [250, 600],
+    # order ∈ [4, 8]; these pin bw and order to isolate width effect.
+    ("BPF 250 Hz", {
+        "bandpass_probability": 1.0,
+        "bandpass_bw_min": 250.0, "bandpass_bw_max": 250.0,
+        "bandpass_order_min": 6, "bandpass_order_max": 6,
+    }),
+    ("BPF 500 Hz", {
+        "bandpass_probability": 1.0,
+        "bandpass_bw_min": 500.0, "bandpass_bw_max": 500.0,
+        "bandpass_order_min": 6, "bandpass_order_max": 6,
     }),
 ]
 
@@ -300,10 +333,17 @@ def eval_cell(
     phase: str,
     condition: str,
     aug_label: str,
-) -> List[float]:
-    """Generate samples, decode, compute CER, log to CSV.  Returns CER list."""
+) -> Tuple[List[float], float, float]:
+    """Generate samples, decode, compute CER, log to CSV.
+
+    Returns (cers, inference_sec, audio_sec). Timing covers only the
+    decode_audio() call so audio generation is excluded from the
+    inference-speed measurement.
+    """
     rng = np.random.default_rng(seed)
-    cers = []
+    cers: List[float] = []
+    inference_sec = 0.0
+    audio_sec = 0.0
     for i in range(n_samples):
         try:
             audio, text, meta = generate_sample(mc, rng=rng)
@@ -311,14 +351,161 @@ def eval_cell(
             print(f"    WARN: gen failed: {e}", file=sys.stderr)
             cers.append(1.0)
             continue
+        audio_sec += float(meta["duration_sec"])
+        t_start = time.perf_counter()
         hyp = decoder.decode_audio(audio)
+        inference_sec += time.perf_counter() - t_start
         cer = compute_cer(hyp, text)
         cers.append(cer)
         if csv_writer:
             csv_writer.writerow(
                 _meta_row(phase, condition, aug_label, i, mc, meta, text, hyp, cer)
             )
-    return cers
+    return cers, inference_sec, audio_sec
+
+
+def _print_speed_summary(label: str, audio_sec: float, infer_sec: float) -> None:
+    """Print a 'Total audio processed / wall clock / rate' summary line."""
+    rate = audio_sec / infer_sec if infer_sec > 0 else 0.0
+    print(
+        f"\n{label} inference speed: "
+        f"total audio processed = {audio_sec/60:.1f} min, "
+        f"wall clock inference = {infer_sec/60:.1f} min, "
+        f"relative inference rate = {rate:.1f}x real-time"
+    )
+
+
+def _run_clean_baseline_grid(
+    dec: CWFormerStreamingDecoder,
+    n: int,
+    writer,
+    phase_label: str,
+    phase_key: str,
+    device_label: str,
+    snr_levels: List[int],
+    wpm_levels: List[int],
+) -> Tuple[Dict[Tuple, List[float]], float, float, float]:
+    """Run the clean SNR x WPM x key-type baseline grid.
+
+    Shared between Phase 1 (chosen device, usually CUDA) and Phase 4
+    (forced CPU). Caller supplies the SNR and WPM levels so the two
+    phases can run different grids (e.g. Phase 4 skips slow WPMs to
+    keep CPU runtime down). Prints progress, summary tables, and an
+    inference-speed summary. Returns (results, audio_sec, infer_sec,
+    wall_sec).
+    """
+    key_types = ["straight", "bug", "paddle", "cootie"]
+
+    total = len(snr_levels) * len(wpm_levels) * len(key_types)
+    print("=" * 72)
+    print(f"{phase_label}: Clean baseline "
+          f"({total} cells x {n} samples, device={device_label})")
+    print("  No augmentations — pure CW signal + AWGN, tight operator timing")
+    print(f"    dah/dit ∈ [2.0, 4.0]  ics ∈ [0.75, 1.5]  iws ∈ [0.75, 1.75]")
+    print("=" * 72)
+
+    results: Dict[Tuple, List[float]] = {}
+    idx = 0
+    t_phase = time.time()
+    infer_total = 0.0
+    audio_total = 0.0
+
+    for snr in snr_levels:
+        for wpm in wpm_levels:
+            for kt in key_types:
+                idx += 1
+                seed = 20000 + (snr + 10) * 1000 + wpm * 10 + key_types.index(kt)
+                mc = make_config(snr, wpm, kt, tight_timing=True)
+                cond = f"SNR={snr} WPM={wpm} {kt}"
+
+                cers, isec, asec = eval_cell(
+                    dec, mc, n, seed, writer,
+                    phase=phase_key, condition=cond, aug_label="none",
+                )
+                results[(snr, wpm, kt)] = cers
+                infer_total += isec
+                audio_total += asec
+                mean = np.mean(cers)
+                elapsed = time.time() - t_phase
+                eta = elapsed / idx * (total - idx)
+                print(f"  [{idx:3d}/{total}] {cond:<30s} "
+                      f"CER={mean:5.1%}  (ETA {eta/60:.0f}m)", flush=True)
+
+    # --- Summary tables ---
+    print("\n" + "=" * 72)
+    print(f"{phase_label} Results: Clean baseline (device={device_label})")
+    print("=" * 72)
+
+    # Table: SNR x WPM (averaged over key types)
+    print(f"\n{'SNR':>5s}", end="")
+    for wpm in wpm_levels:
+        print(f" {wpm:>5d}", end="")
+    print("   Avg")
+    print("-" * (5 + 6 * len(wpm_levels) + 6))
+
+    for snr in snr_levels:
+        print(f"{snr:4d} ", end="")
+        row = []
+        for wpm in wpm_levels:
+            cell = []
+            for kt in key_types:
+                cell.extend(results[(snr, wpm, kt)])
+            row.extend(cell)
+            print(f"{np.mean(cell):5.1%} ", end="")
+        print(f" {np.mean(row):5.1%}")
+
+    print(f"{'Avg':>5s}", end="")
+    for wpm in wpm_levels:
+        col = []
+        for snr in snr_levels:
+            for kt in key_types:
+                col.extend(results[(snr, wpm, kt)])
+        print(f" {np.mean(col):5.1%}", end="")
+    all_cers = [c for v in results.values() for c in v]
+    print(f"  {np.mean(all_cers):5.1%}")
+
+    # Table: Key type x SNR (averaged over WPM)
+    print(f"\n{'Key':>10s}", end="")
+    for snr in snr_levels:
+        print(f" {snr:>5d}", end="")
+    print("   Avg")
+    print("-" * (10 + 6 * len(snr_levels) + 6))
+
+    for kt in key_types:
+        print(f"{kt:>10s}", end="")
+        row = []
+        for snr in snr_levels:
+            cell = []
+            for wpm in wpm_levels:
+                cell.extend(results[(snr, wpm, kt)])
+            row.extend(cell)
+            print(f" {np.mean(cell):5.1%}", end="")
+        print(f"  {np.mean(row):5.1%}")
+
+    # Full breakdown
+    print(f"\n{'SNR':>4s} {'WPM':>4s}", end="")
+    for kt in key_types:
+        print(f" {kt:>8s}", end="")
+    print("    Avg")
+    print("-" * (8 + 9 * len(key_types) + 7))
+
+    for snr in snr_levels:
+        for wpm in wpm_levels:
+            print(f"{snr:4d} {wpm:4d}", end="")
+            row = []
+            for kt in key_types:
+                cell = results[(snr, wpm, kt)]
+                row.extend(cell)
+                print(f" {np.mean(cell):7.1%}", end="")
+            print(f"  {np.mean(row):5.1%}")
+        if snr != snr_levels[-1]:
+            print()
+
+    phase_wall = time.time() - t_phase
+    print(f"\n{phase_label} overall CER: {np.mean(all_cers):.1%}  "
+          f"(wall {phase_wall/60:.1f} min)")
+    _print_speed_summary(phase_label, audio_total, infer_total)
+    return results, audio_total, infer_total, phase_wall
 
 
 
@@ -349,143 +536,72 @@ def main():
         device=args.device,
     )
     n = args.samples
-
-    # ==================================================================
-    # Phase 1: Clean baseline (no augmentations)
-    # ==================================================================
-    snr_levels = [30, 20, 10, 5, 0, -5]
-    wpm_levels = [15, 20, 25, 30, 35]
+    # Needed for Phase 2 (key_types) — the grid itself lives in the helper.
     key_types = ["straight", "bug", "paddle", "cootie"]
 
-    total_p1 = len(snr_levels) * len(wpm_levels) * len(key_types)
-    print("=" * 72)
-    print(f"Phase 1: Clean baseline ({total_p1} cells x {n} samples, greedy)")
-    print("  No augmentations — pure CW signal + AWGN")
-    print("=" * 72)
-
-    p1: Dict[Tuple, List[float]] = {}
-    idx = 0
     t0 = time.time()
 
-    for snr in snr_levels:
-        for wpm in wpm_levels:
-            for kt in key_types:
-                idx += 1
-                seed = 20000 + (snr + 10) * 1000 + wpm * 10 + key_types.index(kt)
-                mc = make_config(snr, wpm, kt)
-                cond = f"SNR={snr} WPM={wpm} {kt}"
-
-                cers = eval_cell(dec, mc, n, seed, writer,
-                                 phase="baseline", condition=cond, aug_label="none")
-                p1[(snr, wpm, kt)] = cers
-                mean = np.mean(cers)
-                elapsed = time.time() - t0
-                eta = elapsed / idx * (total_p1 - idx)
-                print(f"  [{idx:3d}/{total_p1}] {cond:<30s} "
-                      f"CER={mean:5.1%}  (ETA {eta/60:.0f}m)", flush=True)
-
+    # ==================================================================
+    # Phase 1: Clean baseline (no augmentations) — uses user-chosen device
+    # ==================================================================
+    p1_snr_levels = [25, -5]
+    p1_wpm_levels = [35, 20, 10, 5]
+    p1, p1_audio_sec, p1_infer_sec, p1_time = _run_clean_baseline_grid(
+        dec, n, writer,
+        phase_label="Phase 1", phase_key="baseline",
+        device_label=args.device,
+        snr_levels=p1_snr_levels,
+        wpm_levels=p1_wpm_levels,
+    )
     csv_fh.flush()
-
-    # --- Phase 1 summary tables ---
-    print("\n" + "=" * 72)
-    print("Phase 1 Results: Clean baseline")
-    print("=" * 72)
-
-    # Table: SNR x WPM (averaged over key types)
-    print(f"\n{'SNR':>5s}", end="")
-    for wpm in wpm_levels:
-        print(f" {wpm:>5d}", end="")
-    print("   Avg")
-    print("-" * (5 + 6 * len(wpm_levels) + 6))
-
-    for snr in snr_levels:
-        print(f"{snr:4d} ", end="")
-        row = []
-        for wpm in wpm_levels:
-            cell = []
-            for kt in key_types:
-                cell.extend(p1[(snr, wpm, kt)])
-            row.extend(cell)
-            print(f"{np.mean(cell):5.1%} ", end="")
-        print(f" {np.mean(row):5.1%}")
-
-    print(f"{'Avg':>5s}", end="")
-    for wpm in wpm_levels:
-        col = []
-        for snr in snr_levels:
-            for kt in key_types:
-                col.extend(p1[(snr, wpm, kt)])
-        print(f" {np.mean(col):5.1%}", end="")
-    all_p1 = [c for v in p1.values() for c in v]
-    print(f"  {np.mean(all_p1):5.1%}")
-
-    # Table: Key type x SNR (averaged over WPM)
-    print(f"\n{'Key':>10s}", end="")
-    for snr in snr_levels:
-        print(f" {snr:>5d}", end="")
-    print("   Avg")
-    print("-" * (10 + 6 * len(snr_levels) + 6))
-
-    for kt in key_types:
-        print(f"{kt:>10s}", end="")
-        row = []
-        for snr in snr_levels:
-            cell = []
-            for wpm in wpm_levels:
-                cell.extend(p1[(snr, wpm, kt)])
-            row.extend(cell)
-            print(f" {np.mean(cell):5.1%}", end="")
-        print(f"  {np.mean(row):5.1%}")
-
-    # Full breakdown
-    print(f"\n{'SNR':>4s} {'WPM':>4s}", end="")
-    for kt in key_types:
-        print(f" {kt:>8s}", end="")
-    print("    Avg")
-    print("-" * (8 + 9 * len(key_types) + 7))
-
-    for snr in snr_levels:
-        for wpm in wpm_levels:
-            print(f"{snr:4d} {wpm:4d}", end="")
-            row = []
-            for kt in key_types:
-                cell = p1[(snr, wpm, kt)]
-                row.extend(cell)
-                print(f" {np.mean(cell):7.1%}", end="")
-            print(f"  {np.mean(row):5.1%}")
-        if snr != snr_levels[-1]:
-            print()
-
-    p1_time = time.time() - t0
-    print(f"\nPhase 1 overall CER: {np.mean(all_p1):.1%}  ({p1_time/60:.1f} min)")
 
     # ==================================================================
     # Phase 2: Augmentation impact
-    #   Fixed: SNR=20, WPM=25, all key types
-    #   Each augmentation one at a time
+    #   Fixed: SNR=20 dB, WPM=25, all key types. Wide operator-style
+    #   timing (same ranges as the original spec) so each augmentation
+    #   is evaluated against a realistic fist distribution.
+    #   A fresh no-aug baseline is measured at the same (SNR, WPM, wide
+    #   timing) here — cannot reuse Phase 1 because Phase 1 now uses
+    #   tight timing, which would confound the "delta vs base" numbers.
     # ==================================================================
-    aug_snr = 20
+    aug_snr = 6
     aug_wpm = 25
 
     total_p2 = len(AUGMENTATIONS) * len(key_types)
     print("\n" + "=" * 72)
     print(f"Phase 2: Augmentation impact ({total_p2} cells x {n} samples)")
-    print(f"  Fixed: SNR={aug_snr} dB, WPM={aug_wpm}")
-    print(f"  Baseline CER (from Phase 1) shown for comparison")
+    print(f"  Fixed: SNR={aug_snr} dB, WPM={aug_wpm}  "
+          f"(wide operator-style timing)")
+    print(f"  Baseline computed fresh here (no aug, wide timing) so deltas")
+    print(f"  isolate the augmentation effect.")
     print("=" * 72)
-
-    # Baseline from Phase 1 at (aug_snr, aug_wpm)
-    baseline_by_kt = {}
-    for kt in key_types:
-        baseline_by_kt[kt] = np.mean(p1[(aug_snr, aug_wpm, kt)])
-
-    baseline_avg = np.mean([baseline_by_kt[kt] for kt in key_types])
-    print(f"\n  Baseline (no aug): {baseline_avg:5.1%}  "
-          f"[{', '.join(f'{kt}={baseline_by_kt[kt]:.1%}' for kt in key_types)}]\n")
 
     p2: Dict[Tuple[str, str], List[float]] = {}
     idx = 0
     t2 = time.time()
+    p2_infer_sec = 0.0
+    p2_audio_sec = 0.0
+
+    # --- Fresh Phase 2 baseline at (aug_snr, aug_wpm), wide timing ---
+    print(f"\n  Measuring no-aug baseline at SNR={aug_snr} WPM={aug_wpm}...",
+          flush=True)
+    baseline_by_kt: Dict[str, float] = {}
+    for kt in key_types:
+        seed = 3000 + aug_snr * 1000 + aug_wpm * 10 + key_types.index(kt)
+        mc_base = make_config(aug_snr, aug_wpm, kt)  # tight_timing=False
+        cers_b, isec_b, asec_b = eval_cell(
+            dec, mc_base, n, seed, writer,
+            phase="aug_baseline",
+            condition=f"BASE SNR={aug_snr} WPM={aug_wpm} {kt}",
+            aug_label="none",
+        )
+        baseline_by_kt[kt] = float(np.mean(cers_b))
+        p2_infer_sec += isec_b
+        p2_audio_sec += asec_b
+
+    baseline_avg = float(np.mean([baseline_by_kt[kt] for kt in key_types]))
+    print(f"  Baseline (no aug): {baseline_avg:5.1%}  "
+          f"[{', '.join(f'{kt}={baseline_by_kt[kt]:.1%}' for kt in key_types)}]\n")
 
     for aug_label, aug_params in AUGMENTATIONS:
         for kt in key_types:
@@ -495,9 +611,13 @@ def main():
             mc = make_config(aug_snr, aug_wpm, kt, aug_overrides=aug_params)
             cond = f"{aug_label} {kt}"
 
-            cers = eval_cell(dec, mc, n, seed, writer,
-                             phase="augmentation", condition=cond, aug_label=aug_label)
+            cers, isec, asec = eval_cell(
+                dec, mc, n, seed, writer,
+                phase="augmentation", condition=cond, aug_label=aug_label,
+            )
             p2[(aug_label, kt)] = cers
+            p2_infer_sec += isec
+            p2_audio_sec += asec
             mean = np.mean(cers)
             delta = mean - baseline_by_kt[kt]
             eta = (time.time() - t2) / idx * (total_p2 - idx)
@@ -537,6 +657,7 @@ def main():
         print(f"    {aug_avg:5.1%}  {delta:+5.1%}")
 
     p2_time = time.time() - t2
+    _print_speed_summary("Phase 2", p2_audio_sec, p2_infer_sec)
     csv_fh.flush()
 
     # ==================================================================
@@ -552,8 +673,8 @@ def main():
     #   character as correct or error. Aggregating by position across
     #   many samples gives an error-rate-by-position curve.
     # ==================================================================
-    pos_snr_levels = [10, 20, 30]
-    pos_wpm_levels = [15, 20, 25, 30]
+    pos_snr_levels = [6]
+    pos_wpm_levels = [10, 25]
     pos_n = max(n, 20)  # need enough samples for stable position stats
     max_pos = 80  # track up to 80 characters deep
 
@@ -571,6 +692,8 @@ def main():
 
     idx = 0
     t3 = time.time()
+    p3_infer_sec = 0.0
+    p3_audio_sec = 0.0
 
     for snr in pos_snr_levels:
         for wpm in pos_wpm_levels:
@@ -587,7 +710,10 @@ def main():
                 except Exception:
                     continue
 
+                p3_audio_sec += float(meta["duration_sec"])
+                t_start = time.perf_counter()
                 hyp = dec.decode_audio(audio)
+                p3_infer_sec += time.perf_counter() - t_start
                 flags = per_position_errors(hyp, text)
 
                 for pos_idx, is_correct in enumerate(flags):
@@ -671,9 +797,74 @@ def main():
             print(f"  Error rate never stabilizes to within 1.2x of steady-state")
 
     p3_time = time.time() - t3
-    total_time = time.time() - t0
     print(f"\nPhase 3 time: {p3_time/60:.1f} min")
-    print(f"Total time:   {total_time/60:.1f} min")
+    _print_speed_summary("Phase 3", p3_audio_sec, p3_infer_sec)
+    csv_fh.flush()
+
+    # ==================================================================
+    # Phase 4: Clean baseline on CPU (mirrors Phase 1 for speed compare)
+    #   Skipped if Phase 1 already ran on CPU — they would be identical.
+    # ==================================================================
+    print("\n" + "=" * 72)
+    if args.device == "cpu":
+        print("Phase 4: skipped — Phase 1 already ran on CPU "
+              "(device=cpu), so CPU timing is covered above.")
+        print("=" * 72)
+        p4_audio_sec = p1_audio_sec
+        p4_infer_sec = p1_infer_sec
+    else:
+        # Phase 4 uses a trimmed subset of Phase 1's grid — enough to
+        # sanity-check CPU/CUDA accuracy parity and measure CPU inference
+        # speed without the long slow-WPM samples that dominate wall time.
+        p4_snr_levels = [25, -5]
+        p4_wpm_levels = [35, 20]
+        print("Phase 4: Clean baseline on CPU "
+              "(trimmed subset of Phase 1 — CPU speed + accuracy parity)")
+        print("=" * 72)
+        dec_cpu = CWFormerStreamingDecoder(
+            checkpoint=args.checkpoint,
+            chunk_ms=args.chunk_ms,
+            device="cpu",
+        )
+        p4, p4_audio_sec, p4_infer_sec, p4_time = _run_clean_baseline_grid(
+            dec_cpu, n, writer,
+            phase_label="Phase 4", phase_key="baseline_cpu",
+            device_label="cpu",
+            snr_levels=p4_snr_levels,
+            wpm_levels=p4_wpm_levels,
+        )
+        csv_fh.flush()
+
+        # Side-by-side accuracy + speed comparison vs Phase 1. Since
+        # Phase 4 is a subset, compare accuracy only on overlapping
+        # cells (same seed -> identical audio, so a clean parity check).
+        overlap_keys = [k for k in p4.keys() if k in p1]
+        p1_overlap = [c for k in overlap_keys for c in p1[k]]
+        p4_overlap = [c for k in overlap_keys for c in p4[k]]
+        p1_cer_sub = float(np.mean(p1_overlap)) if p1_overlap else 0.0
+        p4_cer_sub = float(np.mean(p4_overlap)) if p4_overlap else 0.0
+        p1_rate = p1_audio_sec / p1_infer_sec if p1_infer_sec > 0 else 0.0
+        p4_rate = p4_audio_sec / p4_infer_sec if p4_infer_sec > 0 else 0.0
+        speedup = (p1_rate / p4_rate) if p4_rate > 0 else float("inf")
+        print(f"\nCUDA vs CPU comparison (Phase 1 vs Phase 4):")
+        print(f"  Speed (whole-phase, different grids):")
+        print(f"    Phase 1 ({args.device:>4s}): "
+              f"rate={p1_rate:6.1f}x real-time  "
+              f"(audio {p1_audio_sec/60:.1f} min, "
+              f"inference {p1_infer_sec/60:.1f} min)")
+        print(f"    Phase 4 ( cpu): "
+              f"rate={p4_rate:6.1f}x real-time  "
+              f"(audio {p4_audio_sec/60:.1f} min, "
+              f"inference {p4_infer_sec/60:.1f} min)")
+        print(f"    CUDA speedup over CPU: {speedup:.1f}x")
+        print(f"  Accuracy parity (overlap: {len(overlap_keys)} cells "
+              f"x {n} samples, same seeds):")
+        print(f"    Phase 1 ({args.device:>4s}): CER={p1_cer_sub:5.1%}")
+        print(f"    Phase 4 ( cpu): CER={p4_cer_sub:5.1%}  "
+              f"(delta {(p4_cer_sub - p1_cer_sub):+.2%})")
+
+    total_time = time.time() - t0
+    print(f"\nTotal time:   {total_time/60:.1f} min")
     print(f"CSV saved to: {args.csv}")
 
 

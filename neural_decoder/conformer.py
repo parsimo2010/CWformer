@@ -159,24 +159,32 @@ class ConformerMHA(nn.Module):
             k_full = torch.cat([k_cached, k], dim=2)  # (B, H, T_cached+T, d_k)
             v_full = torch.cat([v_cached, v], dim=2)
 
-            T_cached = k_cached.shape[2]
-            # Build causal mask: current chunk queries attend to all cached
-            # positions (past) and causally within the current chunk.
-            # mask shape: (T, T_cached + T) — True = masked out
-            # Past part: all False (attend to everything cached)
-            # Chunk part: upper-triangular True (causal within chunk)
-            attn_mask = torch.zeros(T, T_cached + T, dtype=torch.bool,
-                                    device=x.device)
-            if T > 1:
-                causal_chunk = torch.triu(
-                    torch.ones(T, T, dtype=torch.bool, device=x.device),
-                    diagonal=1,
-                )
-                attn_mask[:, T_cached:] = causal_chunk
+            # Build causal mask using tensor-valued shape ops so the ONNX
+            # graph doesn't bake trace-time T and T_cached as Python int
+            # constants. Under the legacy tracer, ``q.shape[-2]`` and
+            # ``k_full.shape[-2]`` return Python ints — any downstream
+            # ``torch.zeros(T, ...)`` / ``torch.ones(T, T)`` / ``torch.triu``
+            # freezes the mask at trace-time (T=50) shape. The chunks-1+
+            # log-prob divergence between PyTorch streaming and ONNX
+            # streaming was tracked to this.
+            #
+            # Mask rule: query at row i (absolute position T_cached + i)
+            # may attend to key at column j (absolute position j) iff
+            # j <= T_cached + i, i.e. disallow when (idx_k - idx_q) >
+            # T_cached. Uses ``torch._shape_as_tensor`` to force Shape
+            # ops in ONNX.
+            T_q_t = torch._shape_as_tensor(q)[-2].to(torch.long)
+            T_k_t = torch._shape_as_tensor(k_full)[-2].to(torch.long)
+            T_cached_t = T_k_t - T_q_t
+            idx_q = torch.arange(T_q_t, device=x.device, dtype=torch.long)
+            idx_k = torch.arange(T_k_t, device=x.device, dtype=torch.long)
+            # (T_q, 1) - broadcast against (1, T_k) -> (T_q, T_k)
+            delta = idx_k.unsqueeze(0) - idx_q.unsqueeze(1)
+            attn_mask = delta > T_cached_t  # (T_q, T_k) bool
 
             # Convert bool mask to float mask for SDPA
             float_mask = torch.zeros_like(attn_mask, dtype=q.dtype)
-            float_mask.masked_fill_(attn_mask, float("-inf"))
+            float_mask = float_mask.masked_fill(attn_mask, float("-inf"))
 
             out = F.scaled_dot_product_attention(
                 q, k_full, v_full, attn_mask=float_mask,

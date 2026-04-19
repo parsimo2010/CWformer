@@ -20,6 +20,11 @@ checkpoints_*/
 # pre-generated audio-based samples
 *.npz
 
+# Release artifacts produced by quantize_cwformer.py — large binaries,
+# published via GitHub releases rather than committed.
+deploy/*.onnx
+deploy/*.npy
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -177,6 +177,7 @@ def evaluate(
     use_amp: bool = False,
     stream_decoder: Optional[CWFormerStreamingDecoder] = None,
     stream_max_audio_sec: Optional[float] = None,
+    stream_max_samples: Optional[int] = None,
 ) -> dict:
     """Evaluate model on a dataset.
 
@@ -249,7 +250,17 @@ def evaluate(
             # (streaming decoder is on the same device, but its own audio
             # tensors will be small per-chunk transfers).
             stream_inputs: list = []
-            if stream_decoder is not None:
+            # Per-sample streaming is serial and ~2 orders of magnitude
+            # slower than batched full-forward; stop collecting for stream
+                # once we've hit the cap so the rest of validation
+            # (full-forward CER + CTC loss) still runs on all samples.
+            stream_budget_remaining = (
+                stream_decoder is not None and (
+                    stream_max_samples is None
+                    or len(all_cer_stream) + stream_skipped < stream_max_samples
+                )
+            )
+            if stream_budget_remaining:
                 audio_cpu = audio_kept.detach().cpu().numpy()
                 audio_lens_cpu = audio_lens_kept.detach().cpu().tolist()
                 for i, L in enumerate(audio_lens_cpu):
@@ -270,9 +281,12 @@ def evaluate(
 
             del log_probs_cpu, out_lens_cpu
 
-            if stream_decoder is not None:
+            if stream_decoder is not None and stream_inputs:
                 sample_rate = stream_decoder.sample_rate
                 for i, audio_i in enumerate(stream_inputs):
+                    if (stream_max_samples is not None
+                            and len(all_cer_stream) >= stream_max_samples):
+                        break
                     # Skip anything longer than the KV cache window so the
                     # streaming path doesn't start trimming context the
                     # full-forward path still has.
@@ -543,23 +557,11 @@ def train(args: argparse.Namespace) -> None:
     train_ds, val_ds, train_loader, val_loader = _build_dataloaders(config)
 
     # ---- Streaming-mode val decoder ----
-    # Resolve CLI override first, then config default. 0 disables the feature
-    # (no decoder built, no per-epoch overhead).
-    stream_val_every = (
-        args.stream_val_every_n_epochs
-        if args.stream_val_every_n_epochs is not None
-        else config.training.stream_val_every_n_epochs
-    )
-    stream_chunk_ms = (
-        args.stream_val_chunk_ms
-        if args.stream_val_chunk_ms is not None
-        else config.training.stream_val_chunk_ms
-    )
-    stream_max_cache_sec = (
-        args.stream_val_max_cache_sec
-        if args.stream_val_max_cache_sec is not None
-        else config.training.stream_val_max_cache_sec
-    )
+    # 0 disables the feature (no decoder built, no per-epoch overhead).
+    stream_val_every = args.stream_val_every_n_epochs
+    stream_chunk_ms = args.stream_val_chunk_ms
+    stream_max_cache_sec = args.stream_val_max_cache_sec
+    stream_max_samples = args.stream_val_samples
     stream_decoder: Optional[CWFormerStreamingDecoder] = None
     if stream_val_every > 0:
         stream_decoder = CWFormerStreamingDecoder.from_model(
@@ -571,7 +573,8 @@ def train(args: argparse.Namespace) -> None:
             max_cache_sec=stream_max_cache_sec,
         )
         print(f"Streaming-val enabled: every {stream_val_every} epoch(s), "
-              f"chunk_ms={stream_chunk_ms}, max_cache_sec={stream_max_cache_sec}")
+              f"chunk_ms={stream_chunk_ms}, max_cache_sec={stream_max_cache_sec}, "
+              f"max_samples={stream_max_samples}")
 
     # ---- CSV log ----
     log_path = ckpt_dir / "training_log.csv"
@@ -811,6 +814,7 @@ def train(args: argparse.Namespace) -> None:
             model, val_loader, device, use_amp,
             stream_decoder=stream_decoder if do_stream else None,
             stream_max_audio_sec=(stream_max_cache_sec if do_stream else None),
+            stream_max_samples=(stream_max_samples if do_stream else None),
         )
 
         elapsed = time.time() - t0
@@ -1145,24 +1149,31 @@ def main():
                              "replay passes; cleaned up before each refill. "
                              "Example: --cache-dir /tmp/cwformer_cache")
 
-    # Streaming-mode validation pass
-    parser.add_argument("--stream-val-every-n-epochs", type=int, default=None,
+    # Streaming-mode validation pass. Defaults mirror the TrainingConfig
+    # defaults; keep the two in sync if you change one.
+    parser.add_argument("--stream-val-every-n-epochs", type=int, default=0,
                         dest="stream_val_every_n_epochs",
                         help="Run a streaming-inference val pass every N epochs "
                              "and log stream_cer alongside greedy_cer. 0 disables "
                              "(default). Streaming-val uses the same val samples "
                              "but routes them through CWFormerStreamingDecoder so "
-                             "the logged number reflects the deployment path. "
-                             "Adds ~10-30%% to val time.")
-    parser.add_argument("--stream-val-chunk-ms", type=int, default=None,
+                             "the logged number reflects the deployment path.")
+    parser.add_argument("--stream-val-chunk-ms", type=int, default=500,
                         dest="stream_val_chunk_ms",
                         help="Chunk size (ms) for streaming-val. Default 500.")
-    parser.add_argument("--stream-val-max-cache-sec", type=float, default=None,
+    parser.add_argument("--stream-val-max-cache-sec", type=float, default=30.0,
                         dest="stream_val_max_cache_sec",
                         help="KV cache cap (s) for streaming-val. Default 30 "
                              "(matches training max_audio_sec). Val samples "
                              "longer than this are skipped so the two paths see "
                              "the same effective context.")
+    parser.add_argument("--stream-val-samples", type=int, default=50,
+                        dest="stream_val_samples",
+                        help="Max val samples to run through the streaming "
+                             "path per eval. Streaming is serial so large "
+                             "caps are expensive (50 samples ~seconds; 5000 "
+                             "~hours). Full-forward CER still runs on the "
+                             "entire val loader. Default 50.")
 
     # Auto-curriculum progression (clean -> moderate -> full)
     parser.add_argument("--auto-curriculum", action="store_true",

@@ -317,6 +317,12 @@ class TrainingConfig:
     stream_val_every_n_epochs: int = 0
     stream_val_chunk_ms: int = 500
     stream_val_max_cache_sec: float = 30.0
+    # Cap on how many val samples go through the streaming path per eval.
+    # Per-sample streaming is serial (each chunk waits on the prior state),
+    # so doing all 5000 val samples turns a 30 s full-forward eval into a
+    # multi-hour wait. 50 samples × ~50 chars each ≈ 2500-char CER base —
+    # enough resolution to spot >~1% drift between paths.
+    stream_val_samples: int = 50
 
     def to_dict(self) -> dict:
         return asdict(self)

@@ -118,21 +118,39 @@ def _create_mel_filterbank(
 class MelComputer:
     """Numpy-based mel spectrogram with streaming support."""
 
-    def __init__(self, config: dict) -> None:
+    def __init__(self, config: dict, config_dir: Optional[str] = None) -> None:
         self.n_fft = config["n_fft"]
         self.hop = config["hop_length"]
         self.n_mels = config["n_mels"]
         self.sample_rate = config["sample_rate"]
 
-        # Periodic Hann window
-        self.window = (
-            0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(self.n_fft) / self.n_fft))
-        ).astype(np.float32)
+        # Load the Hann window and mel filterbank tables that were saved
+        # next to mel_config.json at export time, if present. They are
+        # the bit-exact tables the model was trained with — recomputing
+        # them here in numpy (FP64 intermediates) diverges from torch's
+        # FP32 construction at boundary FFT bins, producing mel values
+        # ~10 orders of magnitude below what training saw. That breaks
+        # silent-frame features and causes inter-word-space detection to
+        # fail. See quantize_cwformer.py and diag_bin0_frame0.py.
+        tables_loaded = False
+        if config_dir is not None:
+            basis_path = Path(config_dir) / "mel_basis.npy"
+            window_path = Path(config_dir) / "mel_window.npy"
+            if basis_path.exists() and window_path.exists():
+                self.mel_basis = np.load(basis_path).astype(np.float32)
+                self.window = np.load(window_path).astype(np.float32)
+                tables_loaded = True
 
-        self.mel_basis = _create_mel_filterbank(
-            self.n_fft, self.sample_rate, self.n_mels,
-            config["f_min"], config["f_max"],
-        )
+        if not tables_loaded:
+            # Legacy fallback — only used if the saved tables aren't
+            # available. Do NOT rely on this for deployment parity.
+            self.window = (
+                0.5 * (1.0 - np.cos(2.0 * np.pi * np.arange(self.n_fft) / self.n_fft))
+            ).astype(np.float32)
+            self.mel_basis = _create_mel_filterbank(
+                self.n_fft, self.sample_rate, self.n_mels,
+                config["f_min"], config["f_max"],
+            )
 
     def compute(self, audio: np.ndarray) -> Tuple[np.ndarray, int]:
         """Compute log-mel spectrogram (full audio, non-streaming).
@@ -252,6 +270,19 @@ def _resample(audio: np.ndarray, sr_in: int, sr_out: int) -> np.ndarray:
         n_out = int(len(audio) * sr_out / sr_in)
         indices = np.linspace(0, len(audio) - 1, n_out)
         return np.interp(indices, np.arange(len(audio)), audio).astype(np.float32)
+
+
+def _peak_normalize(audio: np.ndarray, target_peak: float = 0.7) -> np.ndarray:
+    """Peak-normalize audio to match training distribution.
+
+    ``morse_generator.generate_sample`` normalizes every training sample to
+    ``target_amplitude ∈ [0.5, 0.9]``; file decode must match or the log-mel
+    feature distribution at the subsample input drifts out of distribution.
+    """
+    peak = float(np.max(np.abs(audio))) if audio.size else 0.0
+    if peak < 1e-8:
+        return audio
+    return (audio * (target_peak / peak)).astype(np.float32)
 
 
 def list_devices() -> str:
@@ -416,7 +447,7 @@ class CWFormerStreamingONNX:
             self.config = json.load(f)
 
         self.sample_rate = self.config["sample_rate"]
-        self.mel = MelComputer(self.config)
+        self.mel = MelComputer(self.config, config_dir=str(Path(config_path).parent))
         self.chunk_ms = chunk_ms
         self._chunk_samples = int(chunk_ms * self.sample_rate / 1000)
 
@@ -485,9 +516,19 @@ class CWFormerStreamingONNX:
         return greedy_ctc_decode(all_lp)
 
     def flush(self) -> str:
-        """Process remaining audio. Call at end of stream."""
+        """Process remaining audio. Call at end of stream.
+
+        Right-pads the final chunk with ``n_fft // 2`` zeros so the tail
+        frame count matches training's bilateral pad in
+        ``MelFrontend.forward``. Without this, the last 1–2 mel frames
+        that training saw are missing, truncating the CTC tail.
+        """
         if len(self._audio_buffer) > 0:
-            chunk = self._audio_buffer
+            pad_right = self.mel.n_fft // 2
+            chunk = np.concatenate(
+                [self._audio_buffer,
+                 np.zeros(pad_right, dtype=np.float32)]
+            )
             self._audio_buffer = np.zeros(0, dtype=np.float32)
             return self._process_chunk(chunk)
         return ""
@@ -497,7 +538,14 @@ class CWFormerStreamingONNX:
         return self.decode_audio(audio)
 
     def decode_audio(self, audio: np.ndarray) -> str:
+        """Decode a complete audio array via streaming chunks.
+
+        Peak-normalizes to 0.7 so the input amplitude distribution matches
+        what the model saw during training. Live streams (``decode_live``)
+        do NOT normalize — the caller owns live-audio gain.
+        """
         self.reset()
+        audio = _peak_normalize(audio, target_peak=0.7)
         pos = 0
         while pos < len(audio):
             end = min(pos + self._chunk_samples, len(audio))
@@ -559,13 +607,17 @@ class CWFormerStreamingONNX:
         idx = 0
         log_probs = outputs[idx]; idx += 1
         self._state["pos_offset"] = outputs[idx]; idx += 1
+        # Outputs are emitted in interleaved per-layer order to match
+        # input_names (kv_k_0, kv_v_0, kv_k_1, kv_v_1, ...). Parsing
+        # these as sequential (all Ks then all Vs) scrambles which K/V
+        # belongs to which layer, silently corrupting state carry past
+        # chunk 0 (zero-tensors hide it at chunk 0).
         for i in range(self._n_layers):
             kv_k = outputs[idx]; idx += 1
-            # Trim KV cache
             if kv_k.shape[2] > self._max_cache_len:
                 kv_k = kv_k[:, :, -self._max_cache_len:, :]
             self._state[f"kv_k_layer{i}"] = kv_k
-        for i in range(self._n_layers):
+
             kv_v = outputs[idx]; idx += 1
             if kv_v.shape[2] > self._max_cache_len:
                 kv_v = kv_v[:, :, -self._max_cache_len:, :]

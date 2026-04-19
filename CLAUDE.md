@@ -76,7 +76,7 @@ block. After that retrain, 31 → 63.
 
 ### Deployment
 - `quantize_cwformer.py` — Streaming ONNX export with state I/O (KV caches + conv buffers as explicit input/output tensors). INT8 dynamic quantization.
-- `deploy/inference_onnx.py` — `CWFormerStreamingONNX`: standalone ONNX runtime inference with streaming state management. Supports file, device, and stdin input. **Note**: its `MelComputer.compute_streaming` has known bugs (per-chunk right-pad; fixed-size overlap buffer) that misalign frames at chunk boundaries. IMPROVEMENT_PLAN ports the PyTorch mel logic. Don't use this path for real work until that fix lands.
+- `deploy/inference_onnx.py` — `CWFormerStreamingONNX`: standalone ONNX runtime inference with streaming state management. Supports file, device, and stdin input. `MelComputer.compute_streaming` matches the PyTorch path (variable-length carry-forward, left-pad on first chunk only). `flush()` right-pads by `n_fft // 2` and `decode_audio()` peak-normalizes to 0.7, both mirroring `CWFormerStreamingDecoder`. Live paths (`decode_live`, stdin) do not normalize — caller owns live-audio gain.
 
 ### Testing
 - `tests/test_streaming_equivalence.py` — numerical equivalence check: runs the same audio through `CWFormer.forward()` (training path) and the chunk-by-chunk streaming path, then diffs every intermediate (mel, subsample, each encoder block, log_probs). Also has sub-step diffing inside block 0 (FF1/MHA/conv/FF2/final_norm) for pinpointing divergence. Run after any change to the model or streaming logic.
@@ -145,7 +145,7 @@ target values and per-stage random-gain augmentation setup.
 11. **Peak normalization** — `morse_generator.generate_sample()` peak-normalizes every training sample to `target_amplitude ∈ [0.5, 0.9]`. `CWFormerStreamingDecoder.decode_audio()` peak-normalizes input to 0.7 to match. The live `feed_audio()` path does NOT normalize (caller is responsible).
 12. **Greedy decode only** — no beam search or LM. Beam+LM was tested and didn't help; adds latency without CER gain.
 13. **Weights from CWNet (original bidirectional)** used to be shape-compatible — but IMPROVEMENT_PLAN's conv-kernel change (31→63) and BN→LayerNorm swap break that compatibility. New training runs start from scratch.
-14. **ONNX state I/O** — 36 state tensors per layer (KV K, KV V, conv buffer) + 2 subsample buffers + position offset. Use per-layer naming: `kv_k_layer0`, `kv_v_layer0`, `conv_buf_layer0`, etc. **Caution**: the ONNX mel frontend has known chunk-boundary bugs; fix per IMPROVEMENT_PLAN before relying on this path.
+14. **ONNX state I/O** — 36 state tensors per layer (KV K, KV V, conv buffer) + 2 subsample buffers + position offset. Use per-layer naming: `kv_k_layer0`, `kv_v_layer0`, `conv_buf_layer0`, etc.
 
 ---
 

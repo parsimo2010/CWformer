@@ -1,0 +1,16 @@
+{
+  "sample_rate": 16000,
+  "n_fft": 400,
+  "hop_length": 160,
+  "n_mels": 40,
+  "f_min": 200.0,
+  "f_max": 1400.0,
+  "architecture": "causal_streaming",
+  "n_layers": 12,
+  "n_heads": 4,
+  "d_model": 256,
+  "d_k": 64,
+  "conv_kernel": 63,
+  "max_cache_len": 1500,
+  "subsample_channels": 256
+}
