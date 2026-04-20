@@ -1,5 +1,5 @@
 """
-vocab.py — CTC character vocabulary for CWNet.
+vocab.py — CTC character vocabulary for CWformer.
 
 Index 0 is always reserved for the CTC blank token.
 The vocabulary covers:

@@ -449,7 +449,7 @@ Training sample generation is unchanged. Streaming is purely an inference concer
 ## New Repository File List
 
 ```
-CWNet-Streaming/
+CWformer/
   config.py                          # COPY unchanged
   vocab.py                           # COPY unchanged
   morse_table.py                     # COPY unchanged

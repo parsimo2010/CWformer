@@ -1,5 +1,5 @@
 """
-morse_generator.py — Synthetic Morse code audio generation for CWNet.
+morse_generator.py — Synthetic Morse code audio generation for CWformer.
 
 Generates float32 audio at config.sample_rate for CW-Former training
 and validation.

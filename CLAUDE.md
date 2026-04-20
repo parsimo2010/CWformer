@@ -1,8 +1,8 @@
-# CWNet-Streaming — Claude Reference Overview
+# CWformer — Claude Reference Overview
 
 ## Project Intent & Goals
 
-CWNet-Streaming is a **causal streaming** neural Morse code (CW) decoder, evolved from the bidirectional CW-Former in [CWNet](https://github.com/parsimo2010/CWNet). It uses a fully causal Conformer architecture (~19.5M params) with CTC loss that processes audio left-to-right with no bidirectional attention.
+CWformer is a **causal streaming** neural Morse code (CW) decoder, evolved from the bidirectional CW-Former in [CWNet](https://github.com/parsimo2010/CWNet). It uses a fully causal Conformer architecture (~19.5M params) with CTC loss that processes audio left-to-right with no bidirectional attention.
 
 **Why this exists:** The original CW-Former achieved < 5% CER during training but degraded in real-world streaming due to window stitching artifacts. The sliding-window approach forced a trade-off between accuracy (large windows) and latency (small windows). This project eliminates stitching entirely by using a causal model with KV cache state carry-forward.
 
@@ -89,7 +89,7 @@ block. After that retrain, 31 → 63.
 
 ## Causal Streaming vs CWNet Bidirectional
 
-| Aspect | CWNet (bidirectional) | CWNet-Streaming (causal) |
+| Aspect | CWNet (bidirectional) | CWformer (causal) |
 |--------|----------------------|--------------------------|
 | Attention | Full bidirectional within window | Fully causal (past only) |
 | Convolution | Symmetric padding (pad=15 each side) | Left-only padding (pad=30, 0) |

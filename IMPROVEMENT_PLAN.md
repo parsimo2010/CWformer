@@ -1,4 +1,4 @@
-# CWNet-Streaming Improvement Plan
+# CWformer Improvement Plan
 
 This plan is written to be executed in a fresh Claude Code session. Read
 [CLAUDE.md](CLAUDE.md) first, then this file. The plan is self-contained —
