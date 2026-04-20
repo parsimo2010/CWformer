@@ -1,5 +1,5 @@
 """
-config.py — Configuration for CWNet Morse code decoder.
+config.py — Configuration for CWformer Morse code decoder.
 
 Dataclasses covering audio generation and training:
   MorseConfig    — synthetic audio generation parameters

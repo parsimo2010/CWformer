@@ -1,8 +1,8 @@
-# CWNet-Streaming
+# CWformer
 
 A causal streaming neural Morse code (CW) decoder. It uses a fully causal Conformer architecture (~19.5M parameters) with CTC loss that processes audio left-to-right with no bidirectional attention, eliminating the window-stitching artifacts of the original [CWNet](https://github.com/parsimo2010/CWNet) bidirectional model.
 
-CWNet-Streaming decodes CW from audio in real time — feed it audio from a USB sound card, a file, or stdin, and it emits decoded text as characters are confirmed. It targets 15–40 WPM across all common key types (straight key, bug, paddle, cootie) at SNR > 5–8 dB, with under 2.5 seconds of latency from audio to character emission.
+CWformer decodes CW from audio in real time — feed it audio from a USB sound card, a file, or stdin, and it emits decoded text as characters are confirmed. It targets 15–40 WPM across all common key types (straight key, bug, paddle, cootie) at SNR > 5–8 dB, with under 2.5 seconds of latency from audio to character emission.
 
 ## How It Works
 
@@ -20,7 +20,7 @@ Audio (16 kHz mono)
 ## Project Structure
 
 ```
-CWNet-Streaming/
+CWformer/
 ├── config.py                    # MorseConfig, TrainingConfig
 ├── vocab.py                     # CTC vocabulary (52 classes)
 ├── morse_table.py               # ITU Morse code table + binary trie
@@ -48,7 +48,7 @@ CWNet-Streaming/
 
 ## Running on a Raspberry Pi 5
 
-This section walks through setting up CWNet-Streaming on a Raspberry Pi 5 running Raspberry Pi OS (Bookworm, 64-bit) to decode CW from a USB sound card in real time using the quantized ONNX model.
+This section walks through setting up CWformer on a Raspberry Pi 5 running Raspberry Pi OS (Bookworm, 64-bit) to decode CW from a USB sound card in real time using the quantized ONNX model.
 
 ### Prerequisites
 
@@ -58,8 +58,8 @@ Raspberry Pi OS Bookworm ships with Python 3.11. Install the required system pac
 sudo apt update
 sudo apt install -y python3-venv python3-dev libsndfile1 libportaudio2 git
 
-python3 -m venv ~/cwnet-env
-source ~/cwnet-env/bin/activate
+python3 -m venv ~/cwformer-env
+source ~/cwformer-env/bin/activate
 
 pip install --upgrade pip
 pip install numpy soundfile onnxruntime sounddevice
@@ -71,23 +71,23 @@ Clone the repository and download the pre-trained ONNX model from the GitHub rel
 
 ```bash
 cd ~
-git clone https://github.com/parsimo2010/CWNet-Streaming.git
-cd CWNet-Streaming
+git clone https://github.com/parsimo2010/CWformer.git
+cd CWformer
 
 # Download the quantized ONNX model from the latest release
 gh release download --pattern "cwformer_streaming_int8.onnx" --dir deploy/
 gh release download --pattern "mel_config.json" --dir deploy/
 ```
 
-If you don't have `gh` installed, download the files manually from the [Releases](https://github.com/parsimo2010/CWNet-Streaming/releases) page and place them in the `deploy/` directory.
+If you don't have `gh` installed, download the files manually from the [Releases](https://github.com/parsimo2010/CWformer/releases) page and place them in the `deploy/` directory.
 
 ### Streaming from a USB Sound Card
 
 Plug in your USB sound card and find its device index:
 
 ```bash
-source ~/cwnet-env/bin/activate
-cd ~/CWNet-Streaming
+source ~/cwformer-env/bin/activate
+cd ~/CWformer
 python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx --list-devices
 ```
 
