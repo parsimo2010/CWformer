@@ -2,18 +2,18 @@
 
 A causal streaming neural Morse code (CW) decoder. It uses a fully causal Conformer architecture (~19.5M parameters) with CTC loss that processes audio left-to-right with no bidirectional attention, eliminating the window-stitching artifacts of the original [CWNet](https://github.com/parsimo2010/CWNet) bidirectional model.
 
-CWformer decodes CW from audio in real time — feed it audio from a USB sound card, a file, or stdin, and it emits decoded text as characters are confirmed. It targets 15–40 WPM across all common key types (straight key, bug, paddle, cootie) at SNR > 5–8 dB, with under 2.5 seconds of latency from audio to character emission.
+CWformer decodes CW from audio in real time — feed it audio from a USB sound card, a file, or stdin, and it emits decoded text as characters are confirmed. It targets 15–40 WPM across all common key types (straight key, bug, paddle, cootie) at SNR > 5–8 dB, with under 2.5 seconds of latency from audio to character emission. Current results show it performs decently down to 10 WPM and it has been tested up to 35 WPM with good accuracy, suggesting it can meet the 40 WPM goal. Accuracy degrades progressively worse as speed drops below 10 WPM, and at some high speeed the accuracy will degrade due to the 20ms time resolution of the inputs.
 
 ## How It Works
 
-Audio is processed causally: each frame only sees past context, never the future. During inference, model state (KV caches and convolution buffers) carries forward between processing chunks, so there are no windows to stitch together. A commitment delay prevents premature character emission — characters sharing element prefixes (E=`.`, I=`..`, S=`...`, H=`....`, 5=`.....`) are held until the inter-character space is confirmed.
+Audio is processed causally: each frame only sees past context, never the future. During inference, model state (KV caches and convolution buffers) carries forward between processing chunks, so there are no windows to stitch together. The model is trained so that characters sharing element prefixes (E=`.`, I=`..`, S=`...`, H=`....`, 5=`.....`) are held until the inter-character space is confirmed, ensuring that only correct decodes are emitted.
 
 ```
 Audio (16 kHz mono)
   → Incremental log-mel spectrogram (40 bins, 25ms/10ms)
   → Causal ConvSubsampling (2× time reduction → 50 fps)
   → 12× Causal Conformer blocks (d=256, 4 heads, conv kernel=31)
-  → CTC head → greedy decode with commitment delay
+  → CTC head → greedy decode
   → Text
 ```
 
@@ -67,19 +67,12 @@ pip install numpy soundfile onnxruntime sounddevice
 
 ### Download the Model
 
-Clone the repository and download the pre-trained ONNX model from the GitHub releases:
+Download the latest `cwformer-onnx-v0.1.0.zip` file from the [Releases](https://github.com/parsimo2010/CWformer/releases) page and place it in your home directory. Then run these commands:
 
 ```bash
-cd ~
-git clone https://github.com/parsimo2010/CWformer.git
-cd CWformer
-
-# Download the quantized ONNX model from the latest release
-gh release download --pattern "cwformer_streaming_int8.onnx" --dir deploy/
-gh release download --pattern "mel_config.json" --dir deploy/
+unzip ~/cwformer-onnx-v0.1.0.zip -d ~/onnx-deployment
+cd ~/onnx-deployment
 ```
-
-If you don't have `gh` installed, download the files manually from the [Releases](https://github.com/parsimo2010/CWformer/releases) page and place them in the `deploy/` directory.
 
 ### Streaming from a USB Sound Card
 
@@ -87,20 +80,20 @@ Plug in your USB sound card and find its device index:
 
 ```bash
 source ~/cwformer-env/bin/activate
-cd ~/CWformer
+cd ~/onnx-deployment
 python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx --list-devices
 ```
 
 Start decoding from the device (replace `2` with your device index):
 
 ```bash
-python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx --device 2
+python ~/onnx-deployment/inference_onnx.py --model ~/onnx-deployment/cwformer_streaming_int8.onnx --device 2
 ```
 
 Omit the device number to use the system default input device:
 
 ```bash
-python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx --device
+python ~/onnx-deployment/inference_onnx.py --model ~/onnx-deployment/cwformer_streaming_int8.onnx --device
 ```
 
 ### Streaming from stdin
@@ -110,10 +103,12 @@ You can pipe raw 16-bit signed PCM audio (16 kHz, mono, little-endian) into the 
 ```bash
 # Example: pipe from arecord (ALSA)
 arecord -D hw:1,0 -f S16_LE -r 16000 -c 1 -t raw | \
-  python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx --stdin
+  python ~/onnx-deployment/inference_onnx.py --model ~/onnx-deployment/cwformer_streaming_int8.onnx --stdin
 ```
 
 ## Other Ways to Run Inference
+
+The commands assume you have cloned the repository and have a CWformer directory with folders named `neural_decoder` and `deploy`, and have trained model file in the deploy folder. If you do not, update the checkpiont or model argumentst to point to the correct file location. You will need to download the model files from the releases page because we don't track the model files in GitHub (they are large files).
 
 **Decode an audio file (ONNX):**
 ```bash
@@ -122,7 +117,7 @@ python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx --in
 
 **Decode an audio file (PyTorch checkpoint):**
 ```bash
-python -m neural_decoder.inference_cwformer --checkpoint checkpoints_cwformer_full/best_model.pt --input recording.wav
+python -m neural_decoder.inference_cwformer --checkpoint deploy/best_model.pt --input recording.wav
 ```
 
 **Use the fp32 ONNX model** (slightly more accurate, slower on CPU):
@@ -132,7 +127,7 @@ python deploy/inference_onnx.py --model deploy/cwformer_streaming_fp32.onnx --in
 
 **Run the structured benchmark suite:**
 ```bash
-python benchmark_cwformer.py --checkpoint checkpoints_cwformer_full/best_model.pt --csv results.csv
+python benchmark_cwformer.py --checkpoint deploy/best_model.pt --csv results.csv
 ```
 
 ## Training Your Own Model
