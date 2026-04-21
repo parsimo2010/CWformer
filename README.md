@@ -204,6 +204,7 @@ CWformer/
 
 Open items I'd like to get to (help welcome):
 
+- **Stable release asset name.** Drop the version number from the release zip filename (use something like `cwformer-onnx.zip`) so users can download the latest release with a clean one-liner — `curl -L -o cwformer.zip https://github.com/parsimo2010/CWformer/releases/latest/download/cwformer-onnx.zip` — instead of the current `curl | grep | head | cut | xargs` pipe through the GitHub API.
 - **Simpler install script for Raspberry Pi users.** A single `install.sh` that wraps the apt packages, venv creation, release download, and requirements install into one command so end users don't have to copy multi-step shell blocks.
 - **CI.** GitHub Actions that at minimum runs `tests/test_streaming_equivalence.py` on a tiny synthetic checkpoint and verifies `tests/diagnostic/` scripts still import. A full benchmark in CI would be great eventually but needs a trained model fixture.
 
