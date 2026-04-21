@@ -3,8 +3,8 @@ Complete ITU Morse code table: letters, digits, punctuation, and prosigns.
 
 Prosigns are keyed with angle-bracket names like '<AR>' and are decoded as a
 single printed token.  They share bit-sequences with some punctuation (e.g.
-'<AR>' == '+' == '.-.-.') — the table keeps both entries; the beam search
-prefers the prosign form when no inter-letter space preceded the sequence.
+'<AR>' == '+' == '.-.-.') — the table keeps both entries; prosigns shadow
+the punctuation synonyms in the combined decode table.
 
 Tree structure
 --------------
@@ -79,8 +79,6 @@ _PUNCTUATION: dict[str, str] = {
 }
 
 # Prosigns  (sent without inter-letter space; displayed with angle brackets)
-# Priority: when decoding without a preceding letter gap, prefer these over
-# the punctuation synonyms above.
 # Removed: <HH> (8 elements), <SOS> (9 elements) — rarely needed for QSO;
 # <SOS> decodes naturally as S-O-S when letter spaces are present.
 _PROSIGNS: dict[str, str] = {
@@ -112,13 +110,6 @@ for code, char in _PUNCTUATION.items():
         ENCODE_TABLE[char] = code
 for code, char in _PROSIGNS.items():
     ENCODE_TABLE[char] = code
-
-# Set of prosign code strings (for beam search prosign-path lookup)
-PROSIGN_CODES: frozenset[str] = frozenset(_PROSIGNS.keys())
-
-# Maximum code length (for beam search tree depth limit)
-MAX_CODE_LEN: int = max(len(c) for c in DECODE_TABLE)
-
 
 # ---------------------------------------------------------------------------
 # Morse binary trie

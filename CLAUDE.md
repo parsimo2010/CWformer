@@ -51,7 +51,6 @@ block. After that retrain, 31 → 63.
 - `morse_table.py` — ITU Morse code table + binary trie.
 - `morse_generator.py` — Synthetic training data. `generate_sample(config)` -> `(audio_f32, text, metadata)`. All augmentations: AGC, QSB, QRM, QRN, bandpass, HF noise, key types, timing jitter, speed drift.
 - `qso_corpus.py` — `QSOCorpusGenerator` for realistic ham radio QSO text.
-- `deploy/ctc_decode.py` — Pure-numpy CTC beam search with trigram LM.
 
 ### neural_decoder/ — Causal CW-Former
 
@@ -143,7 +142,7 @@ target values and per-stage random-gain augmentation setup.
 9. **DataLoader tuning** — `persistent_workers=True`, `prefetch_factor=4`. Audio generation is the CPU bottleneck.
 10. **Training uses full sequences** — no chunking during training. Inference chunks are for efficiency/latency, not for training. Streaming equivalence to full-forward is verified for in-distribution audio by `tests/test_streaming_equivalence.py`.
 11. **Peak normalization** — `morse_generator.generate_sample()` peak-normalizes every training sample to `target_amplitude ∈ [0.5, 0.9]`. `CWFormerStreamingDecoder.decode_audio()` peak-normalizes input to 0.7 to match. The live `feed_audio()` path does NOT normalize (caller is responsible).
-12. **Greedy decode only** — no beam search or LM. Beam+LM was tested and didn't help; adds latency without CER gain.
+12. **Greedy decode only** — no beam search or LM. Both were tested and didn't help; they add latency without CER gain.
 13. **Weights from CWNet (original bidirectional)** used to be shape-compatible — but IMPROVEMENT_PLAN's conv-kernel change (31→63) and BN→LayerNorm swap break that compatibility. New training runs start from scratch.
 14. **ONNX state I/O** — 36 state tensors per layer (KV K, KV V, conv buffer) + 2 subsample buffers + position offset. Use per-layer naming: `kv_k_layer0`, `kv_v_layer0`, `conv_buf_layer0`, etc.
 
