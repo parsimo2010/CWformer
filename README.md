@@ -40,8 +40,7 @@ CWformer/
 │   └── inference_cwformer.py    # CWFormerStreamingDecoder
 │
 ├── deploy/
-│   ├── inference_onnx.py        # ONNX Runtime streaming inference
-│   └── ctc_decode.py            # Pure-numpy CTC beam search + LM
+│   └── inference_onnx.py        # ONNX Runtime streaming inference
 │
 └── recordings/                  # Real HF band noise recordings for augmentation
 ```

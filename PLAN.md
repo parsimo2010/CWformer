@@ -64,7 +64,6 @@ Audio (16 kHz mono, streaming)
 - `morse_generator.py` — Synthetic audio generation with all augmentations
 - `config.py` — MorseConfig, TrainingConfig, scenario presets
 - `qso_corpus.py` — QSO corpus text generator
-- `deploy/ctc_decode.py` — Pure-numpy CTC beam search with LM
 
 ### Files to copy and modify
 
@@ -466,7 +465,6 @@ CWformer/
   quantize_cwformer.py               # REWRITE: streaming ONNX with state I/O
   deploy/
     inference_onnx.py                # REWRITE: CWFormerStreamingONNX
-    ctc_decode.py                    # COPY unchanged
   benchmark_cwformer.py              # COPY + add --streaming flag
   benchmark_random_sweep.py          # COPY + add --streaming flag
 ```

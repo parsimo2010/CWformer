@@ -14,10 +14,6 @@ Usage::
     python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx \\
         --input recordings/test.wav
 
-    # Beam search + LM
-    python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx \\
-        --input recordings/test.wav --beam-width 8 --lm trigram_lm.json
-
     # Live from audio device
     python deploy/inference_onnx.py --model deploy/cwformer_streaming_int8.onnx \\
         --device
@@ -39,11 +35,6 @@ import sys
 import time
 from pathlib import Path
 from typing import Dict, Generator, List, Optional, Tuple
-
-# Add project root to path for optional beam search + LM imports
-_project_root = str(Path(__file__).resolve().parent.parent)
-if _project_root not in sys.path:
-    sys.path.insert(0, _project_root)
 
 import numpy as np
 
