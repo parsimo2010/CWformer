@@ -447,7 +447,7 @@ class CWFormerStreamingONNX:
         self._n_heads = self.config.get("n_heads", 4)
         self._d_model = self.config.get("d_model", 256)
         self._d_k = self.config.get("d_k", 64)
-        self._conv_kernel = self.config.get("conv_kernel", 31)
+        self._conv_kernel = self.config.get("conv_kernel", 63)
         self._conv_pad = self._conv_kernel - 1
         self._n_mels = self.config["n_mels"]
         self._subsample_channels = self.config.get("subsample_channels", 256)

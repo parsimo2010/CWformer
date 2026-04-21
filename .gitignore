@@ -10,6 +10,9 @@ archive/
 # Word list for QSO text generation (override *.txt above)
 !google-10000-english-usa.txt
 
+# Python requirement files (override *.txt above)
+!requirements*.txt
+
 # Real HF noise recordings for training augmentation (override *.wav above)
 !recordings/noise_*.wav
 

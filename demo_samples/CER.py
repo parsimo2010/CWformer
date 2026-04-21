@@ -13,21 +13,12 @@ divided by the length of the target.
 from __future__ import annotations
 
 import argparse
+import sys
+from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-def levenshtein(a: str, b: str) -> int:
-    if len(a) < len(b):
-        return levenshtein(b, a)
-    if len(b) == 0:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
-        curr = [i + 1]
-        for j, cb in enumerate(b):
-            cost = 0 if ca == cb else 1
-            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
-        prev = curr
-    return prev[-1]
+from metrics import levenshtein
 
 
 def compute_cer(hypothesis: str, reference: str) -> tuple[float, int, int]:

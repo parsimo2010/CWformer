@@ -11,14 +11,19 @@ of the model graph (in the mel frontend itself), or is it purely a model-
 graph issue?
 
 Usage:
-    python diag_mel_diff.py [audio_file]
+    python tests/diagnostic/diag_mel_diff.py [audio_file]
+
+Edit CHECKPOINT / ONNX_MODEL below to point at the files you want to diff.
 """
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from neural_decoder.inference_cwformer import (
     CWFormerStreamingDecoder,

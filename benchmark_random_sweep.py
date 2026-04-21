@@ -20,35 +20,9 @@ import numpy as np
 import torch
 
 from config import create_default_config
+from metrics import compute_cer
 from morse_generator import generate_sample
 from neural_decoder.inference_cwformer import CWFormerStreamingDecoder
-
-
-# ---------------------------------------------------------------------------
-# CER
-# ---------------------------------------------------------------------------
-
-def levenshtein(a: str, b: str) -> int:
-    if len(a) < len(b):
-        return levenshtein(b, a)
-    if len(b) == 0:
-        return len(a)
-    prev = list(range(len(b) + 1))
-    for i, ca in enumerate(a):
-        curr = [i + 1]
-        for j, cb in enumerate(b):
-            cost = 0 if ca == cb else 1
-            curr.append(min(curr[j] + 1, prev[j + 1] + 1, prev[j] + cost))
-        prev = curr
-    return prev[-1]
-
-
-def compute_cer(hypothesis: str, reference: str) -> float:
-    h = hypothesis.strip().upper()
-    r = reference.strip().upper()
-    if not r:
-        return 0.0 if not h else 1.0
-    return levenshtein(h, r) / len(r)
 
 
 # ---------------------------------------------------------------------------

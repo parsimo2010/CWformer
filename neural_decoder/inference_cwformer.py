@@ -70,9 +70,9 @@ def _load_cwformer_checkpoint(
         n_heads=mc.get("n_heads", 4),
         n_layers=mc.get("n_layers", 12),
         d_ff=mc.get("d_ff", 1024),
-        conv_kernel=mc.get("conv_kernel", 31),
+        conv_kernel=mc.get("conv_kernel", 63),
         dropout=0.0,  # no dropout at inference
-        max_cache_len=mc.get("max_cache_len", 1500),
+        max_cache_len=mc.get("max_cache_len", 1475),
     )
     model_cfg = CWFormerConfig(
         mel=mel_cfg, conformer=conformer_cfg,

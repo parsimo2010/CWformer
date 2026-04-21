@@ -67,6 +67,7 @@ output never changes).
 ### Infrastructure
 - `config.py` — `MorseConfig`, `TrainingConfig`, `create_default_config(scenario)`. **sample_rate = 16000**.
 - `vocab.py` — CTC vocabulary (52 classes). `encode(text)`, `decode(indices)`, `decode_ctc(log_probs)`.
+- `metrics.py` — Shared Levenshtein / CER helpers (`compute_cer`, `levenshtein`, `per_position_errors`). Used by training, benchmarks, and `demo_samples/CER.py`.
 - `morse_table.py` — ITU Morse code table + binary trie.
 - `morse_generator.py` — Synthetic training data. `generate_sample(config)` -> `(audio_f32, text, metadata)`. All augmentations: AGC, QSB, QRM, QRN, bandpass, HF noise, key types, timing jitter, speed drift, input-gain.
 - `qso_corpus.py` — `QSOCorpusGenerator` for realistic ham radio QSO text.
@@ -104,8 +105,8 @@ output never changes).
 - `benchmark_random_sweep.py` — Random parameter sweep benchmark using the `full` scenario distribution.
 
 ### Diagnostics (ad-hoc, not part of the test suite)
-- `diag_mel_diff.py` — Mel-frontend diff: torch.stft vs numpy MelComputer.
-- `diag_chunk_diff.py` — Per-chunk log-prob diff: PyTorch streaming vs ONNX streaming.
+- `tests/diagnostic/diag_mel_diff.py` — Mel-frontend diff: torch.stft vs numpy MelComputer.
+- `tests/diagnostic/diag_chunk_diff.py` — Per-chunk log-prob diff: PyTorch streaming vs ONNX streaming.
 Both scripts hardcode checkpoint/ONNX paths at the top; edit before running.
 
 ---

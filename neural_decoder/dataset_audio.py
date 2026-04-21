@@ -61,7 +61,7 @@ class AudioDataset(IterableDataset):
         epoch_size: int,
         seed: Optional[int] = None,
         qso_text_ratio: float = 0.5,
-        max_audio_sec: float = 15.0,
+        max_audio_sec: float = 30.0,
     ) -> None:
         super().__init__()
         self.morse_cfg = config.morse

@@ -181,112 +181,6 @@ class MorseConfig:
 
 
 # ---------------------------------------------------------------------------
-# FeatureConfig — STFT → SNR ratio feature extraction
-# ---------------------------------------------------------------------------
-
-@dataclass
-class FeatureConfig:
-    """STFT-based adaptive threshold feature extraction parameters.
-
-    MorseEventExtractor uses these parameters to compute per-frame E values
-    and emit MorseEvent objects (mark/space intervals with duration +
-    confidence).  The asymmetric EMA threshold is AGC-immune and requires
-    no explicit noise floor estimation.
-    """
-
-    # Must match MorseConfig.sample_rate; audio resampled to this at inference
-    sample_rate: int = 16000
-
-    # STFT window and hop size (determines freq resolution and frame rate)
-    # window=20ms → 50 Hz/bin at 16 kHz (320 samples); hop=5ms → 200 fps (80 samples)
-    # 20ms window chosen for time resolution: at 40 WPM a dit/space is ~30ms,
-    # so the window clears within 4 hops (20ms) of a transition — enabling
-    # clean inter-element space detection. Cost: -4 dB peak-bin SNR vs 50ms.
-    # 18 bins cover 300-1200 Hz at 50 Hz/bin — adequate for tone detection.
-    # 16 kHz gives 8 kHz Nyquist; audio that arrives at 8 kHz is upsampled
-    # (no new information above 4 kHz, but monitoring range is 300-1200 Hz
-    # so this is irrelevant for signal detection).
-    window_ms: float = 20.0
-    hop_ms: float = 5.0
-
-    # Frequency range to monitor (Hz)
-    # Should cover the expected signal frequency plus margin for noise bins
-    freq_min: int = 300
-    freq_max: int = 1200
-
-    # Blip filter: state changes that last this many frames or fewer are
-    # absorbed back into the current interval and not emitted as events.
-    # A transition is only confirmed after blip_threshold_frames + 1
-    # consecutive frames in the new state.
-    #
-    # Default 2: rejects transitions ≤ 10 ms (at 5 ms/frame), which is
-    # shorter than a dit at 90 WPM (≈ 13.3 ms).  Any feature of the audio
-    # that cannot last at least 3 frames (15 ms) is treated as noise.
-    #
-    # Set to 1 to restore the original single-frame blip filter.
-    # Set to 0 to disable blip filtering (every frame can cause a transition).
-    blip_threshold_frames: int = 2
-
-    # --- Adaptive FAST_DB ---
-    # When enabled, EMA tracking speed adapts based on the current
-    # mark-space spread (proxy for SNR).  At low spread (poor SNR) the
-    # FAST_DB is reduced (more aggressive tracking) so faint marks are
-    # followed faster; at high spread it stays conservative.
-    adaptive_fast_db: bool = True
-    fast_db_min: float = 4.0    # aggressive — used when spread ≈ MIN_SPREAD
-    fast_db_max: float = 6.0    # conservative — used when spread is large
-
-    # --- Threshold center weighting ---
-    # Fraction of the adaptive threshold center attributed to mark_ema.
-    # Higher = more conservative (fewer false marks, but absorbs weak marks).
-    # 0.667 = original 2:1 toward mark; 0.5 = midpoint (equal weight).
-    # 0.55 tested as optimal: +0.10 confidence with no false positive increase.
-    center_mark_weight: float = 0.55
-
-    # --- Adaptive blip filter ---
-    # When enabled, the blip confirmation threshold varies with the
-    # current mark-space spread: tighter confirmation at low spread
-    # (low SNR), faster confirmation at high spread (high SNR).
-    # When disabled, the fixed blip_threshold_frames is used everywhere.
-    adaptive_blip: bool = True
-    blip_threshold_low_snr: int = 3   # frames required at low spread
-    blip_threshold_high_snr: int = 1  # frames required at high spread
-
-    @property
-    def fps(self) -> float:
-        """Output frame rate in frames per second."""
-        return 1000.0 / self.hop_ms
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "FeatureConfig":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-
-
-# ---------------------------------------------------------------------------
-# ModelConfig
-# ---------------------------------------------------------------------------
-
-@dataclass
-class ModelConfig:
-    """Model architecture parameters (retained for config serialization)."""
-
-    in_features: int = 5
-    hidden_size: int = 128
-    n_rnn_layers: int = 3
-    dropout: float = 0.1
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    @classmethod
-    def from_dict(cls, d: dict) -> "ModelConfig":
-        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
-
-
-# ---------------------------------------------------------------------------
 # TrainingConfig — training hyperparameters
 # ---------------------------------------------------------------------------
 
@@ -338,18 +232,14 @@ class TrainingConfig:
 
 @dataclass
 class Config:
-    """Full pipeline configuration (generation + features + model + training)."""
+    """Full pipeline configuration (generation + training)."""
 
     morse: MorseConfig = field(default_factory=MorseConfig)
-    feature: FeatureConfig = field(default_factory=FeatureConfig)
-    model: ModelConfig = field(default_factory=ModelConfig)
     training: TrainingConfig = field(default_factory=TrainingConfig)
 
     def to_dict(self) -> dict:
         return {
             "morse":    self.morse.to_dict(),
-            "feature":  self.feature.to_dict(),
-            "model":    self.model.to_dict(),
             "training": self.training.to_dict(),
         }
 
@@ -362,10 +252,10 @@ class Config:
     def load(cls, path: str) -> "Config":
         with open(path, "r", encoding="utf-8") as fh:
             d = json.load(fh)
+        # Older saved configs may still include "feature" and "model"
+        # sections from the pre-cleanup schema. They are ignored here.
         return cls(
             morse=MorseConfig.from_dict(d.get("morse", {})),
-            feature=FeatureConfig.from_dict(d.get("feature", {})),
-            model=ModelConfig.from_dict(d.get("model", {})),
             training=TrainingConfig.from_dict(d.get("training", {})),
         )
 

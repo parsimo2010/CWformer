@@ -1,0 +1,11 @@
+# Dependencies for training your own CW-Former model.
+# Requires a CUDA-capable GPU for reasonable training speed.
+# AMD GPUs work via ROCm PyTorch builds.
+numpy
+scipy
+soundfile
+torch
+torchaudio
+tqdm
+onnx            # For export via quantize_cwformer.py
+onnxruntime     # For ONNX verification after export

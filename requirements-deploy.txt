@@ -1,0 +1,7 @@
+# Runtime dependencies for decoding with the ONNX model (deploy/inference_onnx.py).
+# Pure-numpy mel + ONNX Runtime. No PyTorch.
+numpy
+soundfile
+onnxruntime
+sounddevice  # Only needed for --device (live audio capture)
+scipy        # Only needed if input audio isn't at 16 kHz (resampling fallback)
