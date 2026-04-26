@@ -1,0 +1,26 @@
+# Portable CWformer web decoder runtime requirements.
+# Install with: pip3 install --user -r deploy/portable/requirements.txt
+
+# Web framework + websockets
+flask>=3.0
+flask-socketio>=5.3
+python-socketio>=5.11
+simple-websocket>=1.0
+
+# Decoder
+numpy>=1.24
+onnxruntime>=1.17
+soundfile>=0.12
+sounddevice>=0.4
+
+# Spectrogram rendering
+pillow>=10.0
+
+# Optional resampling (sample-rate conversion fallback in inference_onnx.py
+# uses scipy if available; without it, a slower numpy interpolation kicks in)
+scipy>=1.10
+
+# Pi GPIO. lgpio is the new pinfactory backend for Bookworm/Pi 5.
+# pip-skipped on non-Linux via PEP 508 markers.
+gpiozero>=2.0; sys_platform == "linux"
+lgpio>=0.2; sys_platform == "linux"

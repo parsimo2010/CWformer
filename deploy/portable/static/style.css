@@ -1,0 +1,201 @@
+:root {
+  color-scheme: dark;
+  --bg: #0e1116;
+  --panel: #161b22;
+  --panel2: #1f2733;
+  --fg: #e6edf3;
+  --muted: #8b949e;
+  --accent: #58a6ff;
+  --warn: #d29922;
+  --danger: #f85149;
+  --ok: #3fb950;
+  --border: #30363d;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+        "Helvetica Neue", Arial, sans-serif;
+}
+
+body.keying { box-shadow: inset 0 0 0 4px var(--ok); }
+
+header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 8px 12px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 10;
+}
+
+header h1 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 0.5px;
+}
+
+.badges { display: flex; gap: 6px; flex-wrap: wrap; }
+
+.badge {
+  display: inline-block;
+  padding: 3px 8px;
+  border-radius: 12px;
+  font-size: 12px;
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  white-space: nowrap;
+}
+.state-idle { background: var(--panel2); }
+.state-running { background: #173f24; color: #aef0bf; border-color: #1f7a3a; }
+.state-error { background: #4f1717; color: #ffb4b4; border-color: #b13838; }
+.sync-synced { background: #173f24; color: #aef0bf; border-color: #1f7a3a; }
+.sync-syncing { background: #3f3217; color: #ffd680; border-color: #7a651f; }
+.sync-unsynced { background: #4f1717; color: #ffb4b4; border-color: #b13838; }
+.sync-unavailable, .sync-unknown { background: var(--panel2); color: var(--muted); }
+.gpio-active { background: #173f24; color: #aef0bf; border-color: #1f7a3a; }
+.gpio-stub { background: #3f3217; color: #ffd680; border-color: #7a651f; }
+
+.panel {
+  margin: 8px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 10px 12px;
+}
+.panel h2 {
+  margin: 0 0 8px;
+  font-size: 14px;
+  text-transform: uppercase;
+  color: var(--muted);
+  letter-spacing: 1px;
+}
+
+.row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 0;
+  flex-wrap: wrap;
+}
+.row label {
+  color: var(--muted);
+  font-size: 13px;
+  flex: 0 0 auto;
+  min-width: 70px;
+}
+.row.buttons { gap: 6px; }
+
+select, input[type="text"], input[type="number"] {
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 8px;
+  font-size: 14px;
+  flex: 1 1 auto;
+  min-width: 80px;
+}
+input[type="number"] { flex: 0 0 80px; }
+input[size="4"] { flex: 0 0 60px; min-width: 60px; }
+
+button, a.button-like {
+  background: var(--panel2);
+  color: var(--fg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 6px 12px;
+  font-size: 14px;
+  cursor: pointer;
+  text-decoration: none;
+  display: inline-block;
+}
+button:hover { background: #28303c; }
+button:disabled { opacity: 0.5; cursor: not-allowed; }
+button.primary { background: #1f6feb; border-color: #1f6feb; color: white; }
+button.primary:hover { background: #2a7af0; }
+button.danger { background: #6c1717; border-color: #b13838; color: #ffd0d0; }
+button.danger:hover { background: #8c2222; }
+button.secondary { background: #2a3340; }
+
+.hint {
+  color: var(--muted);
+  font-size: 12px;
+  margin: 4px 0 8px;
+}
+
+#spectrogram-img {
+  width: 100%;
+  max-width: 640px;
+  height: auto;
+  display: block;
+  margin: 4px auto 8px;
+  border-radius: 4px;
+  border: 1px solid var(--border);
+  image-rendering: pixelated;
+}
+#spectrogram-img:not([src]) { display: none; }
+
+.text-window {
+  background: #06090d;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: #d4ffd4;
+  font: 14px/1.45 ui-monospace, "Cascadia Mono", "Fira Code", Consolas,
+        "Liberation Mono", monospace;
+  margin: 6px 0;
+  padding: 8px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  overflow: auto;
+  min-height: 120px;
+  max-height: 360px;
+}
+.text-window.small { min-height: 60px; max-height: 160px; color: #ffd680; }
+
+.recent {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  flex: 1 1 auto;
+}
+.callsign-btn {
+  background: #1f3046;
+  border: 1px solid #2f5380;
+  color: #c8e1ff;
+  padding: 4px 8px;
+  border-radius: 3px;
+  font-family: ui-monospace, Consolas, monospace;
+  font-size: 13px;
+  cursor: pointer;
+}
+.callsign-btn:hover { background: #2a4a72; }
+
+.macros {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 8px 0;
+}
+.macros button {
+  flex: 1 1 auto;
+  min-width: 90px;
+}
+
+.muted { color: var(--muted); font-size: 12px; }
+
+@media (max-width: 600px) {
+  header h1 { font-size: 16px; }
+  .badge { font-size: 11px; padding: 2px 6px; }
+  .row label { min-width: 60px; font-size: 12px; }
+  .panel { margin: 6px; padding: 8px; }
+}

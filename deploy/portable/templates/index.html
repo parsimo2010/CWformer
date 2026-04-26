@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="theme-color" content="#0e1116">
+<title>CWformer Portable</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+
+<header>
+  <h1>CWformer</h1>
+  <div class="badges">
+    <span id="state-badge" class="badge state-idle">idle</span>
+    <span id="sync-badge" class="badge sync-unknown" title="">sync ?</span>
+    <span id="gpio-badge" class="badge gpio-stub">TX stub</span>
+  </div>
+</header>
+
+<section class="panel" id="source-panel">
+  <h2>Source</h2>
+
+  <div class="row">
+    <label for="model-select">Model</label>
+    <select id="model-select"></select>
+    <button id="btn-refresh-models" class="secondary" type="button"
+            title="Re-scan for .onnx files">Refresh</button>
+  </div>
+  <div class="hint" id="model-hint"></div>
+
+  <div class="row">
+    <label for="source-kind">Type</label>
+    <select id="source-kind">
+      <option value="device">Audio device</option>
+      <option value="file">WAV / FLAC file</option>
+      <option value="command">Command (RTL-SDR etc.)</option>
+    </select>
+  </div>
+
+  <div class="row source-device">
+    <label for="device-select">Device</label>
+    <select id="device-select"></select>
+    <button id="btn-refresh-devices" class="secondary" type="button"
+            title="Re-scan input devices">Refresh</button>
+  </div>
+
+  <div class="row source-file" hidden>
+    <label for="file-select">File</label>
+    <select id="file-select"></select>
+    <button id="btn-refresh-wavs" class="secondary" type="button"
+            title="Re-scan for .wav/.flac/.ogg files">Refresh</button>
+  </div>
+  <div class="hint source-file" id="wav-hint" hidden></div>
+
+  <div class="row source-command" hidden>
+    <label for="command-input">Cmd</label>
+    <input type="text" id="command-input"
+           placeholder="rtl_fm -f 14060000 -M usb -s 16000 -">
+  </div>
+  <div class="hint source-command" hidden>
+    Must emit raw 16-bit signed PCM mono at 16 kHz on stdout.
+    Runs as the server user.
+  </div>
+
+  <div class="row buttons">
+    <button id="btn-start" class="primary">Start</button>
+    <button id="btn-stop" class="danger" disabled>Stop</button>
+    <button id="btn-clear">Clear</button>
+    <button id="btn-spec-toggle" class="secondary">Hide spectrogram</button>
+  </div>
+</section>
+
+<section class="panel" id="rx-panel">
+  <h2>RX</h2>
+  <img id="spectrogram-img" alt="">
+  <pre id="rx-text" class="text-window" tabindex="0"></pre>
+  <div class="row">
+    <label>Recent calls</label>
+    <div id="recent-callsigns" class="recent"></div>
+  </div>
+</section>
+
+<section class="panel" id="tx-panel">
+  <h2>TX</h2>
+  <div class="row">
+    <label for="mycall">My call</label>
+    <input id="mycall" type="text" maxlength="12" autocapitalize="characters">
+    <label for="wpm">WPM</label>
+    <input id="wpm" type="number" min="5" max="60" inputmode="numeric">
+  </div>
+  <div class="row">
+    <label for="hiscall">His call</label>
+    <input id="hiscall" type="text" maxlength="12" autocapitalize="characters">
+    <label for="rst-sent">Sent</label>
+    <input id="rst-sent" type="text" value="599" maxlength="4" size="4">
+    <label for="rst-rcvd">Rcvd</label>
+    <input id="rst-rcvd" type="text" value="599" maxlength="4" size="4">
+  </div>
+  <div class="row">
+    <label for="op-name">Name</label>
+    <input id="op-name" type="text" maxlength="16">
+    <label for="op-qth">QTH</label>
+    <input id="op-qth" type="text" maxlength="20">
+  </div>
+
+  <div id="macro-buttons" class="macros"></div>
+
+  <div class="row">
+    <input type="text" id="freetext"
+           placeholder="Free text… (use &lt;SK&gt; for prosigns)"
+           autocapitalize="characters">
+    <button id="btn-sendtext" class="primary">Send</button>
+    <button id="btn-cancel" class="danger">Stop TX</button>
+  </div>
+
+  <pre id="tx-log" class="text-window small"></pre>
+</section>
+
+<section class="panel" id="log-panel">
+  <h2>Log</h2>
+  <div class="row">
+    <label for="log-filename">Filename</label>
+    <input id="log-filename" type="text" placeholder="SOTA_Mt_Whitney_20260425.log">
+    <button id="btn-rename-log">Set</button>
+  </div>
+  <div class="row">
+    <a id="btn-download-log" href="/api/log/download" download>Download log</a>
+    <span id="log-path" class="muted"></span>
+  </div>
+</section>
+
+<script src="/static/socket.io.min.js"></script>
+<script src="/static/app.js"></script>
+</body>
+</html>
